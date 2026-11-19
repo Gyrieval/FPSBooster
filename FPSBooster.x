@@ -8,8 +8,9 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-// Khớp chính xác chu kỳ thạch anh phần cứng 120.000 Hz (1,000,000,000 / 120 = 8,333,333 ns)
-#define TARGET_PACING_NS 8333333ULL
+// Giữ nhịp đẩy 8.28 ms đã chứng minh khóa 118-120 FPS ở bản 00:07
+#define TARGET_PACING_NS 8280000ULL
+#define MAX_DRIFT_NS     8333333ULL
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -255,21 +256,26 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// Khóa nhịp thạch anh 8,333,333 ns (120.000 Hz) liên tục không ngắt nhịp
+// Soft Phase-Glide 8.28ms: giữ nhịp 118-120 FPS của bản 00:07 và trượt pha mượt không trôi sau 30s
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
 
     if (isBootComplete) {
         uint64_t intervalTicks = nsToMachTicks(TARGET_PACING_NS);
+        uint64_t maxDriftTicks = nsToMachTicks(MAX_DRIFT_NS);
         uint64_t now = mach_absolute_time();
-        if (nextFrameDeadlineTicks == 0 || now > nextFrameDeadlineTicks + intervalTicks) {
+
+        if (nextFrameDeadlineTicks == 0 || now > nextFrameDeadlineTicks + maxDriftTicks) {
             nextFrameDeadlineTicks = now + intervalTicks;
         } else {
             if (now < nextFrameDeadlineTicks) {
                 mach_wait_until(nextFrameDeadlineTicks);
+                nextFrameDeadlineTicks += intervalTicks;
+            } else {
+                // Nếu deadline vừa trôi qua nhẹ (< 8.33ms), trượt pha mềm về mốc now + intervalTicks thay vì tích lũy độ trễ
+                nextFrameDeadlineTicks = now + intervalTicks;
             }
-            nextFrameDeadlineTicks += intervalTicks;
         }
     }
 
@@ -296,11 +302,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO QUARTZ 120.000HZ PACING + ASYNC LOG ===\n"];
+    [msg appendString:@"=== BÁO CÁO SOFT PHASE-GLIDE 118-120HZ + LOG ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"===================================================="];
+    [msg appendString:@"================================================"];
     writeDebugLog(msg);
 }
 
@@ -313,7 +319,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Quartz 120.000Hz Pacing + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Soft Phase-Glide 118-120Hz + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
