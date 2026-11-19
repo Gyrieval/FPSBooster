@@ -27,8 +27,10 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
+static UIView *motionBoostView = nil;
+static NSString *motionBoostStatus = @"Chưa gắn";
 
-// Hệ thống ghi log bất đồng bộ (không chặn Main Thread)
+// Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
 static dispatch_queue_t logWriteQueue = nil;
 static NSInteger frameCount = 0;
@@ -200,7 +202,6 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// 3. Phá trần 80Hz của WindowServer bằng Direct [CATransaction flush] ngay sau Swap Buffer
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
@@ -212,6 +213,47 @@ static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     presentCount++;
     accumPresentMs += machTicksToMs(t1 - t0);
     return res;
+}
+
+// 3. Kích hoạt UIKit CABasicAnimation 120Hz trên UIWindow để ép WindowServer giữ ProMotion 120Hz liên tục
+static void installUIKitMotionBoost(void) {
+    if (motionBoostView) return;
+
+    UIWindow *targetWindow = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w.isKeyWindow) {
+                    targetWindow = w;
+                    break;
+                }
+            }
+        }
+    }
+    if (!targetWindow) {
+        targetWindow = [UIApplication sharedApplication].windows.firstObject;
+    }
+    if (!targetWindow) {
+        motionBoostStatus = @"Lỗi: Không tìm thấy UIWindow";
+        return;
+    }
+
+    motionBoostView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 2, 2)];
+    motionBoostView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.01];
+    motionBoostView.userInteractionEnabled = NO;
+    [targetWindow addSubview:motionBoostView];
+
+    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"position.x"];
+    anim.fromValue = @(1.0);
+    anim.toValue = @(3.0);
+    anim.duration = 0.5;
+    anim.repeatCount = HUGE_VALF;
+    anim.autoreverses = YES;
+    if (@available(iOS 15.0, *)) {
+        anim.preferredFrameRateRange = CAFrameRateRangeMake(120.0f, 120.0f, 120.0f);
+    }
+    [motionBoostView.layer addAnimation:anim forKey:@"proMotion120Boost"];
+    motionBoostStatus = [NSString stringWithFormat:@"OK trên %@ (CABasicAnimation 120Hz)", NSStringFromClass([targetWindow class])];
 }
 
 // 4. Tối ưu VRAM & giữ Triple Buffering
@@ -235,7 +277,6 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
     }
 }
 
-// 5. Chặn điều tiết năng lượng & cảnh báo nhiệt mức nhẹ
 static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) { return NO; }
 static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     NSProcessInfoThermalState realState = ((NSProcessInfoThermalState (*)(id, SEL))orig_thermalState)(self, _cmd);
@@ -250,11 +291,12 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO DIRECT FLUSH (ASYNC LOG) ===\n"];
+    [msg appendString:@"=== BÁO CÁO UIKIT MOTION BOOST 120HZ ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
-    [msg appendFormat:@"- Lệnh presentRenderbuffer + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
+    [msg appendFormat:@"- Lệnh presentRenderbuffer: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
+    [msg appendFormat:@"- Trạng thái Motion Boost: %@\n", motionBoostStatus];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"========================================"];
+    [msg appendString:@"======================================="];
     writeDebugLog(msg);
 }
 
@@ -267,7 +309,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Direct Flush + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (UIKit Motion Boost 120Hz + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -344,6 +386,7 @@ static void dumpDiagnosticLog(void) {
             for (CADisplayLink *link in gameDisplayLinks) {
                 lockLinkTo120(link);
             }
+            installUIKitMotionBoost();
 
             [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
                 dumpDiagnosticLog();
