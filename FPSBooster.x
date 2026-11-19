@@ -28,8 +28,9 @@ static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
 
-// Biến ghi log thuần túy (không can thiệp logic khung hình)
+// Hệ thống ghi log bất đồng bộ (không chặn Main Thread)
 static NSString *logFilePath = nil;
+static dispatch_queue_t logWriteQueue = nil;
 static NSInteger frameCount = 0;
 static NSInteger presentCount = 0;
 static double accumVsyncDeltaMs = 0.0;
@@ -50,19 +51,28 @@ static void writeDebugLog(NSString *message) {
         }
     }
     if (!logFilePath) return;
-
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    [fmt setDateFormat:@"HH:mm:ss.SSS"];
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], message];
-
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
-    if (fh) {
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } else {
-        [line writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    if (!logWriteQueue) {
+        logWriteQueue = dispatch_queue_create("com.fpsbooster.logqueue", DISPATCH_QUEUE_SERIAL);
     }
+
+    NSDate *now = [NSDate date];
+    NSString *targetPath = [logFilePath copy];
+    NSString *msgCopy = [message copy];
+
+    dispatch_async(logWriteQueue, ^{
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        [fmt setDateFormat:@"HH:mm:ss.SSS"];
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:now], msgCopy];
+
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:targetPath];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } else {
+            [line writeToFile:targetPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    });
 }
 
 static inline double machTicksToMs(uint64_t ticks) {
@@ -156,7 +166,6 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     }
 }
 
-// Đo đạc nhịp doCaller và VSync timestamp (không thay đổi hành vi)
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
     if ([sender isKindOfClass:[CADisplayLink class]]) {
         CADisplayLink *dl = (CADisplayLink *)sender;
@@ -191,14 +200,13 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// 3. Mở khóa trần 80Hz của WindowServer bằng Fast Non-Animated CATransaction Flush ngay sau Swap Buffer
+// 3. Phá trần 80Hz của WindowServer bằng Direct [CATransaction flush] ngay sau Swap Buffer
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    [CATransaction commit];
-    [CATransaction flush];
+    if (isBootComplete) {
+        [CATransaction flush];
+    }
     uint64_t t1 = mach_absolute_time();
 
     presentCount++;
@@ -234,7 +242,7 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     return (realState == NSProcessInfoThermalStateFair) ? NSProcessInfoThermalStateNominal : realState;
 }
 
-static void dumpFastFlushDiagnosticLog(void) {
+static void dumpDiagnosticLog(void) {
     NSMutableArray *linksInfo = [NSMutableArray array];
     for (CADisplayLink *link in gameDisplayLinks) {
         double hz = (link.duration > 0) ? (1.0 / link.duration) : 0.0;
@@ -242,11 +250,11 @@ static void dumpFastFlushDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO FAST NON-ANIMATED FLUSH (120HZ CHECK) ===\n"];
+    [msg appendString:@"=== BÁO CÁO DIRECT FLUSH (ASYNC LOG) ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
-    [msg appendFormat:@"- Lệnh presentRenderbuffer + FastFlush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
+    [msg appendFormat:@"- Lệnh presentRenderbuffer + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"======================================================"];
+    [msg appendString:@"========================================"];
     writeDebugLog(msg);
 }
 
@@ -259,7 +267,7 @@ static void dumpFastFlushDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Fast Non-Animated Flush + Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Direct Flush + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -338,7 +346,7 @@ static void dumpFastFlushDiagnosticLog(void) {
             }
 
             [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                dumpFastFlushDiagnosticLog();
+                dumpDiagnosticLog();
             }];
         });
     }
