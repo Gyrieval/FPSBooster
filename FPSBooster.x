@@ -8,10 +8,8 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-#define TARGET_PACING_NS 7950000ULL
-#define TARGET_RENDER_SCALE 1.5
-// Đổi thành 0 nếu muốn ẩn thanh theo dõi FPS
-#define ENABLE_FPS_OVERLAY 1
+// Khôi phục đúng nhịp xả 8.28 ms (8,280,000 ns) đã đạt 103-120 FPS ở log 01:29
+#define TARGET_PACING_NS 8280000ULL
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -23,6 +21,7 @@ static IMP orig_displayLinkWithTarget = NULL;
 static IMP orig_screenDisplayLinkWithTarget = NULL;
 static IMP orig_addToRunLoop = NULL;
 static IMP orig_setAnimationInterval = NULL;
+static IMP orig_doCaller = NULL;
 static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_eaglLayoutSublayers = NULL;
@@ -35,11 +34,52 @@ static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
 static uint64_t nextFrameDeadlineTicks = 0;
 
-// Biến đếm siêu nhẹ cho thanh HUD (chỉ cộng số nguyên mỗi frame)
-static volatile uint32_t hudFrameCounter = 0;
-static UIWindow *fpsHudWindow = nil;
-static UILabel *fpsHudLabel = nil;
-static uint64_t lastHudUpdateTicks = 0;
+// Hệ thống ghi log bất đồng bộ
+static NSString *logFilePath = nil;
+static dispatch_queue_t logWriteQueue = nil;
+static NSInteger frameCount = 0;
+static NSInteger presentCount = 0;
+static double accumVsyncDeltaMs = 0.0;
+static double accumPresentMs = 0.0;
+static CFTimeInterval lastVsyncTimestamp = 0.0;
+
+static double statMeasuredFPS = 0.0;
+static double statPresentFPS = 0.0;
+static double statAvgVsyncDeltaMs = 0.0;
+static double statAvgPresentCostMs = 0.0;
+static uint64_t lastStatTicks = 0;
+
+static void writeDebugLog(NSString *message) {
+    if (!logFilePath) {
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        if (paths.count > 0) {
+            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
+        }
+    }
+    if (!logFilePath) return;
+    if (!logWriteQueue) {
+        logWriteQueue = dispatch_queue_create("com.fpsbooster.logqueue", DISPATCH_QUEUE_SERIAL);
+    }
+
+    NSDate *now = [NSDate date];
+    NSString *targetPath = [logFilePath copy];
+    NSString *msgCopy = [message copy];
+
+    dispatch_async(logWriteQueue, ^{
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        [fmt setDateFormat:@"HH:mm:ss.SSS"];
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:now], msgCopy];
+
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:targetPath];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+            [fh closeFile];
+        } else {
+            [line writeToFile:targetPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+    });
+}
 
 static inline mach_timebase_info_data_t getMachTimebase(void) {
     static mach_timebase_info_data_t timebase;
@@ -47,14 +87,14 @@ static inline mach_timebase_info_data_t getMachTimebase(void) {
     return timebase;
 }
 
-static inline uint64_t nsToMachTicks(uint64_t ns) {
-    mach_timebase_info_data_t tb = getMachTimebase();
-    return (ns * tb.denom) / tb.numer;
-}
-
 static inline double machTicksToMs(uint64_t ticks) {
     mach_timebase_info_data_t tb = getMachTimebase();
     return (double)ticks * (double)tb.numer / (double)tb.denom / 1e6;
+}
+
+static inline uint64_t nsToMachTicks(uint64_t ns) {
+    mach_timebase_info_data_t tb = getMachTimebase();
+    return (ns * tb.denom) / tb.numer;
 }
 
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -139,8 +179,8 @@ static void primeEAGLLayerDynamicState(CALayer *layer) {
     Class eaglCls = NSClassFromString(@"CAEAGLLayer");
     if (!eaglCls || ![layer isKindOfClass:eaglCls]) return;
 
-    if (layer.contentsScale > TARGET_RENDER_SCALE && orig_eaglSetContentsScale) {
-        ((void (*)(id, SEL, CGFloat))orig_eaglSetContentsScale)(layer, @selector(setContentsScale:), TARGET_RENDER_SCALE);
+    if (layer.contentsScale > 2.0 && orig_eaglSetContentsScale) {
+        ((void (*)(id, SEL, CGFloat))orig_eaglSetContentsScale)(layer, @selector(setContentsScale:), 2.0);
     }
     @try {
         if ([layer respondsToSelector:NSSelectorFromString(@"setAsynchronous:")]) {
@@ -156,7 +196,7 @@ static void primeEAGLLayerDynamicState(CALayer *layer) {
 }
 
 static void hooked_eaglSetContentsScale(id self, SEL _cmd, CGFloat scale) {
-    CGFloat targetScale = (scale > TARGET_RENDER_SCALE) ? TARGET_RENDER_SCALE : scale;
+    CGFloat targetScale = (scale > 2.0) ? 2.0 : scale;
     if (orig_eaglSetContentsScale) {
         ((void (*)(id, SEL, CGFloat))orig_eaglSetContentsScale)(self, _cmd, targetScale);
     }
@@ -181,7 +221,45 @@ static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props)
     primeEAGLLayerDynamicState((CALayer *)self);
 }
 
+static void hooked_doCaller(id self, SEL _cmd, id sender) {
+    if ([sender isKindOfClass:[CADisplayLink class]]) {
+        CADisplayLink *dl = (CADisplayLink *)sender;
+        if (lastVsyncTimestamp > 0.0 && dl.timestamp > lastVsyncTimestamp) {
+            accumVsyncDeltaMs += (dl.timestamp - lastVsyncTimestamp) * 1000.0;
+        }
+        lastVsyncTimestamp = dl.timestamp;
+    }
+
+    if (orig_doCaller) {
+        ((void (*)(id, SEL, id))orig_doCaller)(self, _cmd, sender);
+    }
+
+    uint64_t now = mach_absolute_time();
+    frameCount++;
+    if (lastStatTicks == 0) {
+        lastStatTicks = now;
+    } else {
+        double elapsedMs = machTicksToMs(now - lastStatTicks);
+        if (elapsedMs >= 1000.0) {
+            statMeasuredFPS = (double)frameCount * 1000.0 / elapsedMs;
+            statPresentFPS = (double)presentCount * 1000.0 / elapsedMs;
+            statAvgVsyncDeltaMs = (frameCount > 0) ? (accumVsyncDeltaMs / (double)frameCount) : 0.0;
+            statAvgPresentCostMs = (presentCount > 0) ? (accumPresentMs / (double)presentCount) : 0.0;
+
+            frameCount = 0;
+            presentCount = 0;
+            accumVsyncDeltaMs = 0.0;
+            accumPresentMs = 0.0;
+            lastStatTicks = now;
+        }
+    }
+}
+
+// Khôi phục nguyên bản glFlush() + mach_wait_until(8.28ms) + Single Flush (bản 01:29)
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
+    uint64_t t0 = mach_absolute_time();
+    glFlush();
+
     if (isBootComplete) {
         uint64_t intervalTicks = nsToMachTicks(TARGET_PACING_NS);
         uint64_t now = mach_absolute_time();
@@ -197,7 +275,10 @@ static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
 
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
     [CATransaction flush];
-    hudFrameCounter++;
+    uint64_t t1 = mach_absolute_time();
+
+    presentCount++;
+    accumPresentMs += machTicksToMs(t1 - t0);
     return res;
 }
 
@@ -207,76 +288,32 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     return (realState == NSProcessInfoThermalStateFair) ? NSProcessInfoThermalStateNominal : realState;
 }
 
-static void setupFPSOverlayHUD(void) {
-#if ENABLE_FPS_OVERLAY
-    if (fpsHudWindow) return;
-
-    UIWindowScene *activeScene = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
-            activeScene = (UIWindowScene *)scene;
-            break;
-        }
+static void dumpDiagnosticLog(void) {
+    NSMutableArray *linksInfo = [NSMutableArray array];
+    for (CADisplayLink *link in gameDisplayLinks) {
+        double hz = (link.duration > 0) ? (1.0 / link.duration) : 0.0;
+        [linksInfo addObject:[NSString stringWithFormat:@"[paused:%d, hz:%.1f]", link.isPaused, hz]];
     }
 
-    CGRect hudFrame = CGRectMake(54, 10, 92, 22);
-    if (activeScene) {
-        fpsHudWindow = [[UIWindow alloc] initWithWindowScene:activeScene];
-        fpsHudWindow.frame = hudFrame;
-    } else {
-        fpsHudWindow = [[UIWindow alloc] initWithFrame:hudFrame];
-    }
-
-    fpsHudWindow.windowLevel = UIWindowLevelStatusBar + 100.0;
-    fpsHudWindow.userInteractionEnabled = NO;
-    fpsHudWindow.backgroundColor = [UIColor clearColor];
-    fpsHudWindow.opaque = NO;
-
-    UIViewController *vc = [[UIViewController alloc] init];
-    vc.view.backgroundColor = [UIColor clearColor];
-    vc.view.userInteractionEnabled = NO;
-    fpsHudWindow.rootViewController = vc;
-
-    fpsHudLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 92, 22)];
-    fpsHudLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
-    fpsHudLabel.textColor = [UIColor colorWithRed:0.25 green:1.0 blue:0.45 alpha:1.0];
-    fpsHudLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.5 weight:UIFontWeightBold];
-    fpsHudLabel.textAlignment = NSTextAlignmentCenter;
-    fpsHudLabel.layer.cornerRadius = 6.0;
-    fpsHudLabel.layer.masksToBounds = YES;
-    fpsHudLabel.text = @"120.0 FPS";
-    [vc.view addSubview:fpsHudLabel];
-
-    fpsHudWindow.hidden = NO;
-    lastHudUpdateTicks = mach_absolute_time();
-
-    [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
-        uint64_t now = mach_absolute_time();
-        uint32_t frames = hudFrameCounter;
-        hudFrameCounter = 0;
-
-        double elapsedMs = machTicksToMs(now - lastHudUpdateTicks);
-        lastHudUpdateTicks = now;
-        if (elapsedMs <= 0.0) return;
-
-        double currentFps = (double)frames * 1000.0 / elapsedMs;
-        if (currentFps > 120.0) currentFps = 120.0;
-
-        if (currentFps >= 112.0) {
-            fpsHudLabel.textColor = [UIColor colorWithRed:0.25 green:1.0 blue:0.45 alpha:1.0];
-        } else if (currentFps >= 85.0) {
-            fpsHudLabel.textColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:1.0];
-        } else {
-            fpsHudLabel.textColor = [UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:1.0];
-        }
-        fpsHudLabel.text = [NSString stringWithFormat:@"%.1f FPS", currentFps];
-    }];
-#endif
+    NSMutableString *msg = [NSMutableString string];
+    [msg appendString:@"=== BÁO CÁO RESTORED 8.28MS + ASYNC LOG ===\n"];
+    [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
+    [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
+    [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
+    [msg appendString:@"==========================================="];
+    writeDebugLog(msg);
 }
 
 %ctor {
     @autoreleasepool {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+
+        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        if (paths.count > 0) {
+            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
+            [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
+        }
+        writeDebugLog(@"Khởi động FPSBooster (Restored 8.28ms + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -340,6 +377,9 @@ static void setupFPSOverlayHUD(void) {
             if (directorCallerClass) {
                 Method mAnimInt = class_getInstanceMethod(directorCallerClass, NSSelectorFromString(@"setAnimationInterval:"));
                 if (mAnimInt) orig_setAnimationInterval = method_setImplementation(mAnimInt, (IMP)hooked_setAnimationInterval);
+
+                Method mDoCaller = class_getInstanceMethod(directorCallerClass, NSSelectorFromString(@"doCaller:"));
+                if (mDoCaller) orig_doCaller = method_setImplementation(mDoCaller, (IMP)hooked_doCaller);
             }
         });
 
@@ -348,7 +388,10 @@ static void setupFPSOverlayHUD(void) {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
             for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
-            setupFPSOverlayHUD();
+
+            [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+                dumpDiagnosticLog();
+            }];
         });
     }
 }
