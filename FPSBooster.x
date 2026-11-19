@@ -8,9 +8,7 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-// Điểm cân bằng 0.55 ms (550,000 ns): đủ sát mốc 8.33 ms để giữ 120Hz và tránh lố pha
-#define VSYNC_LEAD_NS 550000ULL
-#define VSYNC_PERIOD_NS 8333333ULL
+#define TARGET_PACING_NS 8280000ULL
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -33,7 +31,7 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
-static uint64_t hardwareTargetVSyncTicks = 0;
+static uint64_t nextFrameDeadlineTicks = 0;
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -96,12 +94,6 @@ static inline double machTicksToMs(uint64_t ticks) {
 static inline uint64_t nsToMachTicks(uint64_t ns) {
     mach_timebase_info_data_t tb = getMachTimebase();
     return (ns * tb.denom) / tb.numer;
-}
-
-static inline uint64_t secondsToMachTicks(CFTimeInterval seconds) {
-    if (seconds <= 0.0) return 0;
-    uint64_t ns = (uint64_t)(seconds * 1e9);
-    return nsToMachTicks(ns);
 }
 
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -231,9 +223,6 @@ static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props)
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
     if ([sender isKindOfClass:[CADisplayLink class]]) {
         CADisplayLink *dl = (CADisplayLink *)sender;
-        if (dl.targetTimestamp > 0.0) {
-            hardwareTargetVSyncTicks = secondsToMachTicks(dl.targetTimestamp);
-        }
         if (lastVsyncTimestamp > 0.0 && dl.timestamp > lastVsyncTimestamp) {
             accumVsyncDeltaMs += (dl.timestamp - lastVsyncTimestamp) * 1000.0;
         }
@@ -256,6 +245,9 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
             statAvgVsyncDeltaMs = (frameCount > 0) ? (accumVsyncDeltaMs / (double)frameCount) : 0.0;
             statAvgPresentCostMs = (presentCount > 0) ? (accumPresentMs / (double)presentCount) : 0.0;
 
+            // Hiệu chỉnh lại pha mỗi giây để giữ chuỗi 118-120 FPS không trôi pha
+            nextFrameDeadlineTicks = 0;
+
             frameCount = 0;
             presentCount = 0;
             accumVsyncDeltaMs = 0.0;
@@ -265,20 +257,21 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
+// Auto-Reset Pacing 8.28ms + Single Flush (giữ 118-120 FPS liên tục không trôi pha)
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
 
-    if (isBootComplete && hardwareTargetVSyncTicks > 0) {
-        uint64_t leadTicks = nsToMachTicks(VSYNC_LEAD_NS);
-        uint64_t maxWaitTicks = nsToMachTicks(VSYNC_PERIOD_NS);
+    if (isBootComplete) {
+        uint64_t intervalTicks = nsToMachTicks(TARGET_PACING_NS);
         uint64_t now = mach_absolute_time();
-
-        if (hardwareTargetVSyncTicks > leadTicks) {
-            uint64_t wakeTicks = hardwareTargetVSyncTicks - leadTicks;
-            if (wakeTicks > now && (wakeTicks - now) < maxWaitTicks) {
-                mach_wait_until(wakeTicks);
+        if (nextFrameDeadlineTicks == 0 || now > nextFrameDeadlineTicks + intervalTicks) {
+            nextFrameDeadlineTicks = now + intervalTicks;
+        } else {
+            if (now < nextFrameDeadlineTicks) {
+                mach_wait_until(nextFrameDeadlineTicks);
             }
+            nextFrameDeadlineTicks += intervalTicks;
         }
     }
 
@@ -305,11 +298,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO SINGLE-LAYER LEAD 0.55MS + ASYNC LOG ===\n"];
+    [msg appendString:@"=== BÁO CÁO AUTO-RESET PACING 118-120HZ + LOG ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"===================================================="];
+    [msg appendString:@"=================================================="];
     writeDebugLog(msg);
 }
 
@@ -322,7 +315,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Single-Layer Lead 0.55ms + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Auto-Reset Pacing 118-120Hz + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
