@@ -22,7 +22,6 @@ static IMP orig_doCaller = NULL;
 static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_eaglLayoutSublayers = NULL;
-static IMP orig_eaglSetContentsScale = NULL;
 static IMP orig_metalLayoutSublayers = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
@@ -30,6 +29,8 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
+static CFTimeInterval currentTargetTimestamp = 0.0;
+static NSString *presentMethodUsed = @"Chưa gọi";
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -45,7 +46,6 @@ static double statPresentFPS = 0.0;
 static double statAvgVsyncDeltaMs = 0.0;
 static double statAvgPresentCostMs = 0.0;
 static uint64_t lastStatTicks = 0;
-static CGFloat activeLayerScale = 0.0;
 
 static void writeDebugLog(NSString *message) {
     if (!logFilePath) {
@@ -164,12 +164,6 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
 
 static void primeEAGLLayerDynamicState(CALayer *layer) {
     if (!layer) return;
-    // Giảm tải pixel fill-rate 3x -> 2x Retina để mọi frame luôn hoàn tất dưới 8.33ms
-    if (layer.contentsScale > 2.0 && orig_eaglSetContentsScale) {
-        ((void (*)(id, SEL, CGFloat))orig_eaglSetContentsScale)(layer, @selector(setContentsScale:), 2.0);
-    }
-    activeLayerScale = layer.contentsScale;
-
     @try {
         if ([layer respondsToSelector:NSSelectorFromString(@"setAsynchronous:")]) {
             [layer setValue:@YES forKey:@"asynchronous"];
@@ -181,14 +175,6 @@ static void primeEAGLLayerDynamicState(CALayer *layer) {
             [layer setValue:@YES forKey:@"lowLatency"];
         }
     } @catch (NSException *e) {}
-}
-
-static void hooked_eaglSetContentsScale(id self, SEL _cmd, CGFloat scale) {
-    CGFloat targetScale = (scale > 2.0) ? 2.0 : scale;
-    if (orig_eaglSetContentsScale) {
-        ((void (*)(id, SEL, CGFloat))orig_eaglSetContentsScale)(self, _cmd, targetScale);
-    }
-    activeLayerScale = targetScale;
 }
 
 static void hooked_eaglLayoutSublayers(id self, SEL _cmd) {
@@ -222,6 +208,7 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
     if ([sender isKindOfClass:[CADisplayLink class]]) {
         CADisplayLink *dl = (CADisplayLink *)sender;
+        currentTargetTimestamp = dl.targetTimestamp;
         if (lastVsyncTimestamp > 0.0 && dl.timestamp > lastVsyncTimestamp) {
             accumVsyncDeltaMs += (dl.timestamp - lastVsyncTimestamp) * 1000.0;
         }
@@ -253,11 +240,28 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// Single Flush + glFlush để đẩy lệnh GPU sớm nhất và không lặp IPC
+// Sử dụng presentRenderbuffer:atTime: / afterMinimumDuration: để chốt lịch quét 120Hz (8.33ms) với WindowServer
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
-    BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
+
+    BOOL res = NO;
+    SEL selAtTime = @selector(presentRenderbuffer:atTime:);
+    SEL selMinDur = @selector(presentRenderbuffer:afterMinimumDuration:);
+
+    if (currentTargetTimestamp > 0.0 && [self respondsToSelector:selAtTime]) {
+        IMP impAtTime = [self methodForSelector:selAtTime];
+        res = ((BOOL (*)(id, SEL, NSUInteger, CFTimeInterval))impAtTime)(self, selAtTime, target, currentTargetTimestamp);
+        presentMethodUsed = @"presentRenderbuffer:atTime: (Target VSync)";
+    } else if ([self respondsToSelector:selMinDur]) {
+        IMP impMinDur = [self methodForSelector:selMinDur];
+        res = ((BOOL (*)(id, SEL, NSUInteger, CFTimeInterval))impMinDur)(self, selMinDur, target, (1.0 / 120.0));
+        presentMethodUsed = @"presentRenderbuffer:afterMinimumDuration: (8.33ms)";
+    } else {
+        res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
+        presentMethodUsed = @"presentRenderbuffer: (Gốc)";
+    }
+
     [CATransaction flush];
     uint64_t t1 = mach_absolute_time();
 
@@ -280,11 +284,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO SINGLE-FLUSH + 2X SCALE (120HZ) ===\n"];
+    [msg appendString:@"=== BÁO CÁO TARGET VSYNC PRESENT (120HZ LOCK) ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
-    [msg appendFormat:@"- Lệnh glFlush + present + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh) | Scale: %.1fx\n", statPresentFPS, statAvgPresentCostMs, activeLayerScale];
+    [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (TB: %.2f ms/lệnh) | API: %@\n", statPresentFPS, statAvgPresentCostMs, presentMethodUsed];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"================================================"];
+    [msg appendString:@"================================================="];
     writeDebugLog(msg);
 }
 
@@ -297,7 +301,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Single-Flush + 2x Scale + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Target VSync Present + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -338,9 +342,6 @@ static void dumpDiagnosticLog(void) {
 
             Method mLayout = class_getInstanceMethod(eaglLayerClass, @selector(layoutSublayers));
             if (mLayout) orig_eaglLayoutSublayers = method_setImplementation(mLayout, (IMP)hooked_eaglLayoutSublayers);
-
-            Method mScale = class_getInstanceMethod(eaglLayerClass, @selector(setContentsScale:));
-            if (mScale) orig_eaglSetContentsScale = method_setImplementation(mScale, (IMP)hooked_eaglSetContentsScale);
         }
 
         Class eaglContextClass = NSClassFromString(@"EAGLContext");
