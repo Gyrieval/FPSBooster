@@ -28,6 +28,7 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
+static BOOL pendingRunLoopFlush = NO;
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -159,7 +160,6 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
 }
 
-// Khôi phục đúng logic CAEAGLLayer layoutSublayers của bản 23:19-23:20 (không đụng opaque = YES)
 static void primeEAGLLayerDynamicState(CALayer *layer) {
     if (!layer) return;
     @try {
@@ -241,6 +241,14 @@ static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
     [CATransaction flush];
+    if (!pendingRunLoopFlush) {
+        pendingRunLoopFlush = YES;
+        CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+            pendingRunLoopFlush = NO;
+            [CATransaction flush];
+        });
+        CFRunLoopWakeUp(CFRunLoopGetMain());
+    }
     uint64_t t1 = mach_absolute_time();
 
     presentCount++;
@@ -262,11 +270,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO KHÔI PHỤC BẢN 23:19 (ASYNC LOG) ===\n"];
+    [msg appendString:@"=== BÁO CÁO DUAL-PHASE FLUSH + ASYNC LOG ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
-    [msg appendFormat:@"- Lệnh presentRenderbuffer + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
+    [msg appendFormat:@"- Lệnh presentRenderbuffer + DualFlush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"==============================================="];
+    [msg appendString:@"============================================"];
     writeDebugLog(msg);
 }
 
@@ -279,7 +287,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Bản 23:19 + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Dual-Phase Flush + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
