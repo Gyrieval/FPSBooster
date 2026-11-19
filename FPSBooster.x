@@ -10,6 +10,7 @@
 #define TARGET_FPS 120
 // Mục tiêu nhịp xả 8.28 ms (~120.7 Hz) để luôn chốt trước deadline VSync 8.33 ms của ProMotion
 #define TARGET_PACING_NS 8280000ULL
+#define MAX_HISTORY_SECONDS 3600
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -34,6 +35,14 @@ static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
 static uint64_t nextFrameDeadlineTicks = 0;
 
+// Bộ đệm RAM thuần C (0 cấp phát Objective-C, 0 ghi đĩa trong lúc chơi)
+static double fpsHistory[MAX_HISTORY_SECONDS];
+static int historyCount = 0;
+static uint32_t secondFrameCount = 0;
+static uint64_t secondStartTicks = 0;
+static uint64_t totalSessionFrames = 0;
+static uint64_t sessionStartTicks = 0;
+
 static inline mach_timebase_info_data_t getMachTimebase(void) {
     static mach_timebase_info_data_t timebase;
     if (timebase.denom == 0) mach_timebase_info(&timebase);
@@ -43,6 +52,50 @@ static inline mach_timebase_info_data_t getMachTimebase(void) {
 static inline uint64_t nsToMachTicks(uint64_t ns) {
     mach_timebase_info_data_t tb = getMachTimebase();
     return (ns * tb.denom) / tb.numer;
+}
+
+static inline double machTicksToMs(uint64_t ticks) {
+    mach_timebase_info_data_t tb = getMachTimebase();
+    return (double)ticks * (double)tb.numer / (double)tb.denom / 1e6;
+}
+
+static void flushRamSummaryToFile(void) {
+    if (totalSessionFrames == 0 || sessionStartTicks == 0) return;
+
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (paths.count == 0) return;
+    NSString *summaryPath = [paths[0] stringByAppendingPathComponent:@"fps_summary.txt"];
+
+    uint64_t now = mach_absolute_time();
+    double totalSec = machTicksToMs(now - sessionStartTicks) / 1000.0;
+    double avgFps = (totalSec > 0.0) ? ((double)totalSessionFrames / totalSec) : 0.0;
+
+    double minFps = 999.0;
+    double maxFps = 0.0;
+    for (int i = 0; i < historyCount; i++) {
+        if (fpsHistory[i] < minFps) minFps = fpsHistory[i];
+        if (fpsHistory[i] > maxFps) maxFps = fpsHistory[i];
+    }
+    if (historyCount == 0) {
+        minFps = avgFps;
+        maxFps = avgFps;
+    }
+
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    [fmt setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
+
+    NSMutableString *report = [NSMutableString string];
+    [report appendFormat:@"=== TÓM TẮT HIỆU NĂNG ARCAEA (%@) ===\n", [fmt stringFromDate:[NSDate date]]];
+    [report appendFormat:@"- Thời gian đo: %.1f giây | Tổng khung hình: %llu\n", totalSec, totalSessionFrames];
+    [report appendFormat:@"- FPS Trung bình: %.1f FPS | Thấp nhất: %.1f FPS | Cao nhất: %.1f FPS\n", avgFps, minFps, maxFps];
+    [report appendString:@"- Chi tiết từng giây (FPS): "];
+
+    for (int i = 0; i < historyCount; i++) {
+        [report appendFormat:@"%.1f%s", fpsHistory[i], (i < historyCount - 1) ? ", " : "\n"];
+    }
+    [report appendString:@"========================================================\n"];
+
+    [report writeToFile:summaryPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -175,13 +228,13 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
     }
 }
 
-// Khóa nhịp xuất khung hình bằng mach_wait_until (8.28 ms) + Single Flush để giữ cứng pha 120Hz của ProMotion
+// Khóa nhịp xuất khung hình bằng mach_wait_until (8.28 ms) + Single Flush (giữ nguyên bản 00:07)
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     glFlush();
 
+    uint64_t now = mach_absolute_time();
     if (isBootComplete) {
         uint64_t intervalTicks = nsToMachTicks(TARGET_PACING_NS);
-        uint64_t now = mach_absolute_time();
         if (nextFrameDeadlineTicks == 0 || now > nextFrameDeadlineTicks + intervalTicks) {
             nextFrameDeadlineTicks = now + intervalTicks;
         } else {
@@ -194,6 +247,27 @@ static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
 
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
     [CATransaction flush];
+
+    // Ghi nhận khung hình vào mảng RAM thuần C
+    if (isBootComplete) {
+        uint64_t tDone = mach_absolute_time();
+        if (sessionStartTicks == 0) {
+            sessionStartTicks = tDone;
+            secondStartTicks = tDone;
+        }
+        totalSessionFrames++;
+        secondFrameCount++;
+
+        double secElapsedMs = machTicksToMs(tDone - secondStartTicks);
+        if (secElapsedMs >= 1000.0) {
+            if (historyCount < MAX_HISTORY_SECONDS) {
+                fpsHistory[historyCount++] = (double)secondFrameCount * 1000.0 / secElapsedMs;
+            }
+            secondFrameCount = 0;
+            secondStartTicks = tDone;
+        }
+    }
+
     return res;
 }
 
@@ -269,6 +343,14 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
 
         Method mThermal = class_getInstanceMethod(processInfoClass, @selector(thermalState));
         if (mThermal) orig_thermalState = method_setImplementation(mThermal, (IMP)hooked_thermalState);
+
+        // Đăng ký xuất 1 file tóm tắt duy nhất khi vuốt thoát ra màn hình chính / chuyển ứng dụng
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillResignActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            flushRamSummaryToFile();
+        }];
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             Class directorCallerClass = NSClassFromString(@"CCDirectorCaller");
