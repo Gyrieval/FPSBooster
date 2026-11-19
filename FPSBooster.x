@@ -13,17 +13,16 @@ static IMP orig_setPreferredFramesPerSecond = NULL;
 static IMP orig_setPreferredFrameRateRange = NULL;
 static IMP orig_setFrameInterval = NULL;
 static IMP orig_displayLinkWithTarget = NULL;
-static IMP orig_addToRunLoop = NULL;
+static IMP orig_setAnimationInterval = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_metalLayoutSublayers = NULL;
-static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
 
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 
-// 1. Giả lập Info.plist trong RAM (Đã xác nhận hoạt động 100% qua log)
+// 1. Giả lập Info.plist trong RAM (Cache 1 lần duy nhất)
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
     if ([key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"] ||
         [key isEqualToString:@"CADisableMinimumFrameDuration"]) {
@@ -55,11 +54,10 @@ static NSInteger hooked_maxFramesPerSecond(id self, SEL _cmd) {
     return TARGET_FPS;
 }
 
-// 2. Khóa nhịp CADisplayLink chuẩn xác (khắc phục lỗi game tự hạ Range xuống max:80 hoặc 119)
+// 2. Khóa nhịp CADisplayLink ở 120 FPS (gỡ bỏ hook addToRunLoop để không làm kẹt luồng Loading)
 static inline void lockLinkTo120(CADisplayLink *link) {
     if (!link) return;
     if (@available(iOS 15.0, *)) {
-        // Dùng dải (120, 120, 120) chuẩn để không bị lệch pha 119Hz
         CAFrameRateRange locked = CAFrameRateRangeMake(120.0f, 120.0f, 120.0f);
         if (orig_setPreferredFrameRateRange) {
             ((void (*)(id, SEL, CAFrameRateRange))orig_setPreferredFrameRateRange)(link, @selector(setPreferredFrameRateRange:), locked);
@@ -82,13 +80,6 @@ static CADisplayLink *hooked_displayLinkWithTarget(id self, SEL _cmd, id target,
     return link;
 }
 
-static void hooked_addToRunLoop(id self, SEL _cmd, NSRunLoop *runloop, NSRunLoopMode mode) {
-    if (orig_addToRunLoop) {
-        ((void (*)(id, SEL, NSRunLoop *, NSRunLoopMode))orig_addToRunLoop)(self, _cmd, runloop, NSRunLoopCommonModes);
-    }
-    lockLinkTo120((CADisplayLink *)self);
-}
-
 static void hooked_setPreferredFramesPerSecond(id self, SEL _cmd, NSInteger fps) {
     lockLinkTo120((CADisplayLink *)self);
 }
@@ -101,12 +92,18 @@ static void hooked_setFrameInterval(id self, SEL _cmd, NSInteger interval) {
     lockLinkTo120((CADisplayLink *)self);
 }
 
-// 3. Tối ưu hóa trực tiếp lệnh xuất khung hình OpenGL ES (EAGLContext presentRenderbuffer:)
-static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
-    // Đảm bảo luồng gọi presentRenderbuffer luôn ở mức ưu tiên cao nhất và không bị ngủ trễ
-    return orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
+// 3. Gọi lại hàm gốc setAnimationInterval: với tham số 1.0/120.0 để CCDirectorCaller chuyển cảnh bình thường
+static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
+    double targetInterval = (1.0 / 120.0);
+    if (orig_setAnimationInterval) {
+        ((void (*)(id, SEL, double))orig_setAnimationInterval)(self, _cmd, targetInterval);
+    }
+    for (CADisplayLink *link in gameDisplayLinks) {
+        lockLinkTo120(link);
+    }
 }
 
+// 4. Tối ưu bộ đệm VRAM & Triple Buffering
 static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
     NSMutableDictionary *optProps = props ? [NSMutableDictionary dictionaryWithDictionary:props] : [NSMutableDictionary dictionary];
     optProps[@"EAGLDrawablePropertyRetainedBacking"] = @NO;
@@ -127,23 +124,9 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
         if ([metalLayer respondsToSelector:@selector(setFramebufferOnly:)]) {
             metalLayer.framebufferOnly = YES;
         }
-        // Giữ 3 bộ đệm (Triple Buffering) trên Metal layer ẩn để OpenGL ES không bị kẹt chờ VSync 70fps
         if ([metalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) {
             metalLayer.maximumDrawableCount = 3;
         }
-    }
-}
-
-// 4. Vô hiệu hóa bộ giới hạn nhịp nội bộ của CCDirectorCaller (nếu game tự gọi setAnimationInterval:)
-static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
-    // Ép khoảng thời gian mỗi khung hình về đúng 1.0 / 120.0 (0.008333s)
-    Ivar ivar = class_getInstanceVariable([self class], "interval");
-    if (ivar) {
-        ptrdiff_t offset = ivar_getOffset(ivar);
-        *(double *)((uint8_t *)(__bridge void *)self + offset) = (1.0 / 120.0);
-    }
-    for (CADisplayLink *link in gameDisplayLinks) {
-        lockLinkTo120(link);
     }
 }
 
@@ -178,9 +161,6 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
         Method mCreate = class_getClassMethod(displayLinkClass, @selector(displayLinkWithTarget:selector:));
         if (mCreate) orig_displayLinkWithTarget = method_setImplementation(mCreate, (IMP)hooked_displayLinkWithTarget);
 
-        Method mAddRunLoop = class_getInstanceMethod(displayLinkClass, @selector(addToRunLoop:forMode:));
-        if (mAddRunLoop) orig_addToRunLoop = method_setImplementation(mAddRunLoop, (IMP)hooked_addToRunLoop);
-
         Method mFps = class_getInstanceMethod(displayLinkClass, @selector(setPreferredFramesPerSecond:));
         if (mFps) orig_setPreferredFramesPerSecond = method_setImplementation(mFps, (IMP)hooked_setPreferredFramesPerSecond);
 
@@ -198,12 +178,6 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
             if (mDrawProps) orig_setDrawableProperties = method_setImplementation(mDrawProps, (IMP)hooked_setDrawableProperties);
         }
 
-        Class eaglContextClass = NSClassFromString(@"EAGLContext");
-        if (eaglContextClass) {
-            Method mPresent = class_getInstanceMethod(eaglContextClass, @selector(presentRenderbuffer:));
-            if (mPresent) orig_presentRenderbuffer = method_setImplementation(mPresent, (IMP)hooked_presentRenderbuffer);
-        }
-
         Class metalLayerClass = [CAMetalLayer class];
         if (metalLayerClass) {
             Method mMetalLayout = class_getInstanceMethod(metalLayerClass, @selector(layoutSublayers));
@@ -217,7 +191,6 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
         Method mThermal = class_getInstanceMethod(processInfoClass, @selector(thermalState));
         if (mThermal) orig_thermalState = method_setImplementation(mThermal, (IMP)hooked_thermalState);
 
-        // Hook trực tiếp lớp CCDirectorCaller của Cocos2d-x sau khi game nạp xong
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
@@ -226,7 +199,7 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
             if (directorCallerClass) {
                 Method mAnimInt = class_getInstanceMethod(directorCallerClass, NSSelectorFromString(@"setAnimationInterval:"));
                 if (mAnimInt) {
-                    method_setImplementation(mAnimInt, (IMP)hooked_setAnimationInterval);
+                    orig_setAnimationInterval = method_setImplementation(mAnimInt, (IMP)hooked_setAnimationInterval);
                 }
             }
         });
