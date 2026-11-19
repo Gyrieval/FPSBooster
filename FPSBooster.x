@@ -29,7 +29,7 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
-static BOOL isStaggeredKickQueued = NO;
+static BOOL hasRenderedNewFrame = NO;
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -173,9 +173,9 @@ static void primeEAGLLayerDynamicState(CALayer *layer) {
         if ([layer respondsToSelector:NSSelectorFromString(@"setAsynchronous:")]) {
             [layer setValue:@YES forKey:@"asynchronous"];
         }
-        // Đặt presentsWithTransaction = YES để WindowServer nhận tín hiệu đồng bộ giao dịch mỗi frame
+        // Giữ presentsWithTransaction = NO để không bị khóa trần 80Hz của CoreAnimation
         if ([layer respondsToSelector:NSSelectorFromString(@"setPresentsWithTransaction:")]) {
-            [layer setValue:@YES forKey:@"presentsWithTransaction"];
+            [layer setValue:@NO forKey:@"presentsWithTransaction"];
         }
         if ([layer respondsToSelector:NSSelectorFromString(@"setLowLatency:")]) {
             [layer setValue:@YES forKey:@"lowLatency"];
@@ -243,25 +243,24 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// Micro-Staggered Transaction Kick: đánh thức WindowServer 120Hz mà không chặn Main Thread
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
     [CATransaction flush];
-
-    if (isBootComplete && !isStaggeredKickQueued) {
-        isStaggeredKickQueued = YES;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            isStaggeredKickQueued = NO;
-            [CATransaction flush];
-        });
-    }
+    hasRenderedNewFrame = YES;
     uint64_t t1 = mach_absolute_time();
 
     presentCount++;
     accumPresentMs += machTicksToMs(t1 - t0);
     return res;
+}
+
+static void onRunLoopBeforeWaiting(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info) {
+    if (isBootComplete && hasRenderedNewFrame) {
+        hasRenderedNewFrame = NO;
+        [CATransaction flush];
+    }
 }
 
 static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) { return NO; }
@@ -278,11 +277,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO STAGGERED KICK + TX PRESENT (120HZ) ===\n"];
+    [msg appendString:@"=== BÁO CÁO RUNLOOP OBSERVER PHASE-FLUSH + LOG ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"==================================================="];
+    [msg appendString:@"=================================================="];
     writeDebugLog(msg);
 }
 
@@ -295,7 +294,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Staggered Kick + Tx Present + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (RunLoop Observer Phase-Flush + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -370,6 +369,11 @@ static void dumpDiagnosticLog(void) {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
             for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
+
+            CFRunLoopObserverRef observer = CFRunLoopObserverCreate(kCFAllocatorDefault, kCFRunLoopBeforeWaiting, true, 0, &onRunLoopBeforeWaiting, NULL);
+            if (observer) {
+                CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
+            }
 
             [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
                 dumpDiagnosticLog();
