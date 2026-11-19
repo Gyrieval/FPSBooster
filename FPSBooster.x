@@ -24,7 +24,6 @@ static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_eaglLayoutSublayers = NULL;
 static IMP orig_eaglSetContentsScale = NULL;
-static IMP orig_metalLayoutSublayers = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
 
@@ -302,18 +301,6 @@ static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props)
         ((void (*)(id, SEL, NSDictionary *))orig_setDrawableProperties)(self, _cmd, optProps);
     }
     primeEAGLLayerDynamicState((CALayer *)self);
-}
-
-static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
-    if (orig_metalLayoutSublayers) {
-        ((void (*)(id, SEL))orig_metalLayoutSublayers)(self, _cmd);
-    }
-    if ([self isKindOfClass:[CAMetalLayer class]]) {
-        CAMetalLayer *metalLayer = (CAMetalLayer *)self;
-        if ([metalLayer respondsToSelector:@selector(setPresentsWithTransaction:)]) metalLayer.presentsWithTransaction = NO;
-        if ([metalLayer respondsToSelector:@selector(setFramebufferOnly:)]) metalLayer.framebufferOnly = YES;
-        if ([metalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) metalLayer.maximumDrawableCount = 3;
-    }
 }
 
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
