@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <OpenGLES/ES2/gl.h>
 #import <objc/runtime.h>
 #import <pthread.h>
 #import <mach/mach_time.h>
@@ -20,21 +21,28 @@ static IMP orig_setAnimationInterval = NULL;
 static IMP orig_doCaller = NULL;
 static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_setDrawableProperties = NULL;
-static IMP orig_metalLayoutSublayers = NULL;
+static IMP orig_eaglLayoutSublayers = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
 
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
-
-// Biến ghi log FPS thuần túy (không can thiệp logic khung hình)
 static NSString *logFilePath = nil;
-static NSInteger doCallerTicks = 0;
-static NSInteger presentTicks = 0;
-static double measuredDoCallerHz = 0.0;
-static double measuredPresentFPS = 0.0;
-static uint64_t lastSampleTicks = 0;
+
+// Biến đo đạc chi tiết
+static NSInteger frameCount = 0;
+static NSInteger presentCount = 0;
+static double accumVsyncDeltaMs = 0.0;
+static double accumPresentMs = 0.0;
+static CFTimeInterval lastVsyncTimestamp = 0.0;
+
+static double statMeasuredFPS = 0.0;
+static double statPresentFPS = 0.0;
+static double statAvgVsyncDeltaMs = 0.0;
+static double statAvgPresentCostMs = 0.0;
+static uint64_t lastStatTicks = 0;
+static NSString *eaglLayerPropsStatus = @"Chưa kiểm tra";
 
 static void writeDebugLog(NSString *message) {
     if (!logFilePath) {
@@ -61,26 +69,8 @@ static void writeDebugLog(NSString *message) {
 
 static inline double machTicksToMs(uint64_t ticks) {
     static mach_timebase_info_data_t timebase;
-    if (timebase.denom == 0) {
-        mach_timebase_info(&timebase);
-    }
+    if (timebase.denom == 0) mach_timebase_info(&timebase);
     return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
-}
-
-static void updateFPSCounters(void) {
-    uint64_t now = mach_absolute_time();
-    if (lastSampleTicks == 0) {
-        lastSampleTicks = now;
-        return;
-    }
-    double elapsedMs = machTicksToMs(now - lastSampleTicks);
-    if (elapsedMs >= 1000.0) {
-        measuredDoCallerHz = (double)doCallerTicks * 1000.0 / elapsedMs;
-        measuredPresentFPS = (double)presentTicks * 1000.0 / elapsedMs;
-        doCallerTicks = 0;
-        presentTicks = 0;
-        lastSampleTicks = now;
-    }
 }
 
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -101,9 +91,7 @@ static NSDictionary *hooked_infoDictionary(id self, SEL _cmd) {
             cachedPatchedInfoDict = [mut copy];
         }
     }
-    if (self == [NSBundle mainBundle] && cachedPatchedInfoDict) {
-        return cachedPatchedInfoDict;
-    }
+    if (self == [NSBundle mainBundle] && cachedPatchedInfoDict) return cachedPatchedInfoDict;
     return orig_infoDictionary ? ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(self, _cmd) : nil;
 }
 
@@ -126,9 +114,7 @@ static inline void lockLinkTo120(CADisplayLink *link) {
 
 static void trackAndLockLink(CADisplayLink *link) {
     if (!link) return;
-    if (!gameDisplayLinks) {
-        gameDisplayLinks = [NSHashTable weakObjectsHashTable];
-    }
+    if (!gameDisplayLinks) gameDisplayLinks = [NSHashTable weakObjectsHashTable];
     [gameDisplayLinks addObject:link];
     lockLinkTo120(link);
 }
@@ -153,39 +139,52 @@ static void hooked_addToRunLoop(id self, SEL _cmd, NSRunLoop *runloop, NSRunLoop
     lockLinkTo120((CADisplayLink *)self);
 }
 
-static void hooked_setPreferredFramesPerSecond(id self, SEL _cmd, NSInteger fps) {
-    lockLinkTo120((CADisplayLink *)self);
-}
-
-static void hooked_setPreferredFrameRateRange(id self, SEL _cmd, CAFrameRateRange range) API_AVAILABLE(ios(15.0)) {
-    lockLinkTo120((CADisplayLink *)self);
-}
-
-static void hooked_setFrameInterval(id self, SEL _cmd, NSInteger interval) {
-    lockLinkTo120((CADisplayLink *)self);
-}
+static void hooked_setPreferredFramesPerSecond(id self, SEL _cmd, NSInteger fps) { lockLinkTo120((CADisplayLink *)self); }
+static void hooked_setPreferredFrameRateRange(id self, SEL _cmd, CAFrameRateRange range) API_AVAILABLE(ios(15.0)) { lockLinkTo120((CADisplayLink *)self); }
+static void hooked_setFrameInterval(id self, SEL _cmd, NSInteger interval) { lockLinkTo120((CADisplayLink *)self); }
 
 static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     if (orig_setAnimationInterval) {
         ((void (*)(id, SEL, double))orig_setAnimationInterval)(self, _cmd, (1.0 / 120.0));
     }
-    for (CADisplayLink *link in gameDisplayLinks) {
-        lockLinkTo120(link);
-    }
+    for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
 }
 
-static void hooked_doCaller(id self, SEL _cmd, id sender) {
-    doCallerTicks++;
-    updateFPSCounters();
-    if (orig_doCaller) {
-        ((void (*)(id, SEL, id))orig_doCaller)(self, _cmd, sender);
-    }
+// Kích hoạt thuộc tính ẩn của CAEAGLLayer và ghi nhận trạng thái hỗ trợ của hệ điều hành
+static void optimizeEAGLLayerFor120Hz(CALayer *layer) {
+    if (!layer) return;
+    BOOL hasAsync = NO, hasTxn = NO, hasLowLat = NO;
+    id valAsync = nil, valTxn = nil, valLowLat = nil;
+
+    @try {
+        if ([layer respondsToSelector:NSSelectorFromString(@"setAsynchronous:")]) {
+            hasAsync = YES;
+            [layer setValue:@YES forKey:@"asynchronous"];
+            valAsync = [layer valueForKey:@"asynchronous"];
+        }
+        if ([layer respondsToSelector:NSSelectorFromString(@"setPresentsWithTransaction:")]) {
+            hasTxn = YES;
+            [layer setValue:@NO forKey:@"presentsWithTransaction"];
+            valTxn = [layer valueForKey:@"presentsWithTransaction"];
+        }
+        if ([layer respondsToSelector:NSSelectorFromString(@"setLowLatency:")]) {
+            hasLowLat = YES;
+            [layer setValue:@YES forKey:@"lowLatency"];
+            valLowLat = [layer valueForKey:@"lowLatency"];
+        }
+    } @catch (NSException *e) {}
+
+    eaglLayerPropsStatus = [NSString stringWithFormat:@"async(%d:%@), txn(%d:%@), lowLat(%d:%@)",
+                            hasAsync, valAsync ?: @"N/A",
+                            hasTxn, valTxn ?: @"N/A",
+                            hasLowLat, valLowLat ?: @"N/A"];
 }
 
-static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
-    presentTicks++;
-    updateFPSCounters();
-    return orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
+static void hooked_eaglLayoutSublayers(id self, SEL _cmd) {
+    if (orig_eaglLayoutSublayers) {
+        ((void (*)(id, SEL))orig_eaglLayoutSublayers)(self, _cmd);
+    }
+    optimizeEAGLLayerFor120Hz((CALayer *)self);
 }
 
 static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
@@ -194,28 +193,61 @@ static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props)
     if (orig_setDrawableProperties) {
         ((void (*)(id, SEL, NSDictionary *))orig_setDrawableProperties)(self, _cmd, optProps);
     }
+    optimizeEAGLLayerFor120Hz((CALayer *)self);
 }
 
-static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
-    if (orig_metalLayoutSublayers) {
-        ((void (*)(id, SEL))orig_metalLayoutSublayers)(self, _cmd);
+static void hooked_doCaller(id self, SEL _cmd, id sender) {
+    if ([sender isKindOfClass:[CADisplayLink class]]) {
+        CADisplayLink *dl = (CADisplayLink *)sender;
+        if (lastVsyncTimestamp > 0.0 && dl.timestamp > lastVsyncTimestamp) {
+            accumVsyncDeltaMs += (dl.timestamp - lastVsyncTimestamp) * 1000.0;
+        }
+        lastVsyncTimestamp = dl.timestamp;
     }
-    if ([self isKindOfClass:[CAMetalLayer class]]) {
-        CAMetalLayer *metalLayer = (CAMetalLayer *)self;
-        if ([metalLayer respondsToSelector:@selector(setPresentsWithTransaction:)]) metalLayer.presentsWithTransaction = NO;
-        if ([metalLayer respondsToSelector:@selector(setFramebufferOnly:)]) metalLayer.framebufferOnly = YES;
-        if ([metalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) metalLayer.maximumDrawableCount = 3;
+
+    if (orig_doCaller) {
+        ((void (*)(id, SEL, id))orig_doCaller)(self, _cmd, sender);
     }
+
+    uint64_t now = mach_absolute_time();
+    frameCount++;
+    if (lastStatTicks == 0) {
+        lastStatTicks = now;
+    } else {
+        double elapsedMs = machTicksToMs(now - lastStatTicks);
+        if (elapsedMs >= 1000.0) {
+            statMeasuredFPS = (double)frameCount * 1000.0 / elapsedMs;
+            statPresentFPS = (double)presentCount * 1000.0 / elapsedMs;
+            statAvgVsyncDeltaMs = (frameCount > 0) ? (accumVsyncDeltaMs / (double)frameCount) : 0.0;
+            statAvgPresentCostMs = (presentCount > 0) ? (accumPresentMs / (double)presentCount) : 0.0;
+
+            frameCount = 0;
+            presentCount = 0;
+            accumVsyncDeltaMs = 0.0;
+            accumPresentMs = 0.0;
+            lastStatTicks = now;
+        }
+    }
+}
+
+static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
+    uint64_t t0 = mach_absolute_time();
+    BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
+    [CATransaction flush];
+    uint64_t t1 = mach_absolute_time();
+
+    presentCount++;
+    accumPresentMs += machTicksToMs(t1 - t0);
+    return res;
 }
 
 static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) { return NO; }
-
 static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     NSProcessInfoThermalState realState = ((NSProcessInfoThermalState (*)(id, SEL))orig_thermalState)(self, _cmd);
     return (realState == NSProcessInfoThermalStateFair) ? NSProcessInfoThermalStateNominal : realState;
 }
 
-static void dumpFPSVerificationLog(void) {
+static void dumpDirectDisplayDiagnosticLog(void) {
     NSMutableArray *linksInfo = [NSMutableArray array];
     for (CADisplayLink *link in gameDisplayLinks) {
         double hz = (link.duration > 0) ? (1.0 / link.duration) : 0.0;
@@ -223,11 +255,12 @@ static void dumpFPSVerificationLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO FPS THỰC TẾ ===\n"];
-    [msg appendFormat:@"- Nhịp CCDirectorCaller::doCaller: %.1f Hz\n", measuredDoCallerHz];
-    [msg appendFormat:@"- Tốc độ xuất hình GPU (presentRenderbuffer): %.1f FPS\n", measuredPresentFPS];
+    [msg appendString:@"=== BÁO CÁO DIRECT-TO-DISPLAY EAGL + FLUSH ===\n"];
+    [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
+    [msg appendFormat:@"- Lệnh presentRenderbuffer + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
+    [msg appendFormat:@"- Thuộc tính CAEAGLLayer: %@\n", eaglLayerPropsStatus];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"==========================="];
+    [msg appendString:@"=============================================="];
     writeDebugLog(msg);
 }
 
@@ -240,7 +273,7 @@ static void dumpFPSVerificationLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Bản chuẩn + Log kiểm tra FPS)...");
+        writeDebugLog(@"Khởi động FPSBooster (Direct-to-Display EAGL + CATransaction Flush + Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -278,18 +311,15 @@ static void dumpFPSVerificationLog(void) {
         if (eaglLayerClass) {
             Method mDrawProps = class_getInstanceMethod(eaglLayerClass, @selector(setDrawableProperties:));
             if (mDrawProps) orig_setDrawableProperties = method_setImplementation(mDrawProps, (IMP)hooked_setDrawableProperties);
+
+            Method mLayout = class_getInstanceMethod(eaglLayerClass, @selector(layoutSublayers));
+            if (mLayout) orig_eaglLayoutSublayers = method_setImplementation(mLayout, (IMP)hooked_eaglLayoutSublayers);
         }
 
         Class eaglContextClass = NSClassFromString(@"EAGLContext");
         if (eaglContextClass) {
             Method mPresent = class_getInstanceMethod(eaglContextClass, @selector(presentRenderbuffer:));
             if (mPresent) orig_presentRenderbuffer = method_setImplementation(mPresent, (IMP)hooked_presentRenderbuffer);
-        }
-
-        Class metalLayerClass = [CAMetalLayer class];
-        if (metalLayerClass) {
-            Method mMetalLayout = class_getInstanceMethod(metalLayerClass, @selector(layoutSublayers));
-            if (mMetalLayout) orig_metalLayoutSublayers = method_setImplementation(mMetalLayout, (IMP)hooked_metalLayoutSublayers);
         }
 
         Class processInfoClass = [NSProcessInfo class];
@@ -310,16 +340,14 @@ static void dumpFPSVerificationLog(void) {
             }
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             isBootComplete = YES;
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
-            for (CADisplayLink *link in gameDisplayLinks) {
-                lockLinkTo120(link);
-            }
+            for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
 
             [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                dumpFPSVerificationLog();
+                dumpDirectDisplayDiagnosticLog();
             }];
         });
     }
