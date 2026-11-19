@@ -38,7 +38,7 @@ jobs:
           THEOS: /Users/runner/theos
         run: |
           make clean || true
-          make package
+          make
 
       - name: Upload Dylib Artifact
         uses: actions/upload-artifact@v4
