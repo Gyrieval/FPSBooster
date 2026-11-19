@@ -8,7 +8,8 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-#define TARGET_PACING_NS 7850000ULL
+// Nhịp xả 8.25 ms (8,250,000 ns) khớp khít 120.0 Hz (8.33 ms)
+#define TARGET_PACING_NS 8250000ULL
 #define MAX_HISTORY_SECONDS 3600
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
@@ -34,7 +35,11 @@ static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
 static uint64_t nextFrameDeadlineTicks = 0;
 
-// Bộ đệm RAM thuần C (0 cấp phát Objective-C, 0 ghi đĩa trong lúc chơi)
+// Tham chiếu trực tiếp tới CAEAGLLayer của game để giữ nhịp ProMotion 120Hz
+static __weak CALayer *activeGameEAGLLayer = nil;
+static BOOL jitterToggle = NO;
+
+// Bộ đệm RAM thuần C
 static double fpsHistory[MAX_HISTORY_SECONDS];
 static int historyCount = 0;
 static uint32_t secondFrameCount = 0;
@@ -84,7 +89,7 @@ static void flushRamSummaryToFile(void) {
     [fmt setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
 
     NSMutableString *report = [NSMutableString string];
-    [report appendFormat:@"=== TÓM TẮT HIỆU NĂNG ARCAEA (%@) ===\n", [fmt stringFromDate:[NSDate date]]];
+    [report appendFormat:@"=== TÓM TẮT HIỆU NĂNG 119-120HZ (%@) ===\n", [fmt stringFromDate:[NSDate date]]];
     [report appendFormat:@"- Thời gian đo: %.1f giây | Tổng khung hình: %llu\n", totalSec, totalSessionFrames];
     [report appendFormat:@"- FPS Trung bình: %.1f FPS | Thấp nhất: %.1f FPS | Cao nhất: %.1f FPS\n", avgFps, minFps, maxFps];
     [report appendString:@"- Chi tiết từng giây (FPS): "];
@@ -176,6 +181,8 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
 
 static void primeEAGLLayerDynamicState(CALayer *layer) {
     if (!layer) return;
+    activeGameEAGLLayer = layer;
+
     if (layer.contentsScale > 2.0 && orig_eaglSetContentsScale) {
         ((void (*)(id, SEL, CGFloat))orig_eaglSetContentsScale)(layer, @selector(setContentsScale:), 2.0);
     }
@@ -227,12 +234,21 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
     }
 }
 
-// Khóa nhịp xuất khung hình bằng mach_wait_until (8.28 ms) + Single Flush (giữ nguyên bản 00:07)
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     glFlush();
 
     uint64_t now = mach_absolute_time();
     if (isBootComplete) {
+        // Giữ WindowServer luôn ở bậc 120Hz (chặn tụt về 96Hz khi màn hình ít biến thiên)
+        CALayer *layer = activeGameEAGLLayer;
+        if (layer) {
+            jitterToggle = !jitterToggle;
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            layer.contentsRect = jitterToggle ? CGRectMake(0.0, 0.0, 1.0, 1.0) : CGRectMake(0.00001, 0.0, 0.99999, 1.0);
+            [CATransaction commit];
+        }
+
         uint64_t intervalTicks = nsToMachTicks(TARGET_PACING_NS);
         if (nextFrameDeadlineTicks == 0 || now > nextFrameDeadlineTicks + intervalTicks) {
             nextFrameDeadlineTicks = now + intervalTicks;
@@ -247,7 +263,6 @@ static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
     [CATransaction flush];
 
-    // Ghi nhận khung hình vào mảng RAM thuần C
     if (isBootComplete) {
         uint64_t tDone = mach_absolute_time();
         if (sessionStartTicks == 0) {
@@ -343,7 +358,6 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
         Method mThermal = class_getInstanceMethod(processInfoClass, @selector(thermalState));
         if (mThermal) orig_thermalState = method_setImplementation(mThermal, (IMP)hooked_thermalState);
 
-        // Đăng ký xuất 1 file tóm tắt duy nhất khi vuốt thoát ra màn hình chính / chuyển ứng dụng
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillResignActiveNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
