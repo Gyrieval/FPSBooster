@@ -4,14 +4,27 @@ on:
   push:
   workflow_dispatch:
 
+concurrency:
+  group: build-fpsbooster-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Cache Theos & SDK
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: /Users/runner/theos
+          key: theos-macos-sdk-v1
+
       - name: Setup Theos & iOS SDK
+        if: steps.cache-theos.outputs.cache-hit != 'true'
         run: |
           git clone --recursive --depth 1 https://github.com/theos/theos.git $HOME/theos
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks-temp
