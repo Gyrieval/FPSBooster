@@ -3,7 +3,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <pthread.h>
-#import <mach/mach_time.h>
 
 #define TARGET_FPS 120
 
@@ -18,56 +17,14 @@ static IMP orig_addToRunLoop = NULL;
 static IMP orig_setAnimationInterval = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_metalLayoutSublayers = NULL;
-static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
 
-static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
-static NSString *logFilePath = nil;
-static BOOL isLoadingFinished = NO;
+static __weak CADisplayLink *activeDirectorLink = nil;
+static BOOL isBootComplete = NO;
 
-// Biến đo đạc FPS thực tế tại EAGLContext
-static uint64_t lastMeasureTime = 0;
-static NSInteger presentedFramesCount = 0;
-static double measuredRealFPS = 0.0;
-static double minFrameDeltaMs = 999.0;
-static double maxFrameDeltaMs = 0.0;
-static uint64_t lastFrameTimestamp = 0;
-static NSMutableArray *displayLinkTargetsLog = nil;
-
-static void writeDebugLog(NSString *message) {
-    if (!logFilePath) {
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (paths.count > 0) {
-            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
-        }
-    }
-    if (!logFilePath) return;
-
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    [fmt setDateFormat:@"HH:mm:ss.SSS"];
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], message];
-
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
-    if (fh) {
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } else {
-        [line writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-}
-
-static inline double machTicksToMs(uint64_t ticks) {
-    static mach_timebase_info_data_t timebase;
-    if (timebase.denom == 0) {
-        mach_timebase_info(&timebase);
-    }
-    return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
-}
-
-// 1. Giả lập Info.plist trong RAM
+// 1. Giả lập Info.plist trong RAM (Cache 1 lần duy nhất)
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
     if ([key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"] ||
         [key isEqualToString:@"CADisableMinimumFrameDuration"]) {
@@ -99,7 +56,7 @@ static NSInteger hooked_maxFramesPerSecond(id self, SEL _cmd) {
     return TARGET_FPS;
 }
 
-// 2. Theo dõi & khóa CADisplayLink
+// 2. Khóa nhịp 120 FPS và đảm bảo chỉ tồn tại 1 CADisplayLink duy nhất cho CCDirectorCaller
 static inline void lockLinkTo120(CADisplayLink *link) {
     if (!link) return;
     if (@available(iOS 15.0, *)) {
@@ -116,17 +73,22 @@ static inline void lockLinkTo120(CADisplayLink *link) {
 static CADisplayLink *hooked_displayLinkWithTarget(id self, SEL _cmd, id target, SEL sel) {
     CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))orig_displayLinkWithTarget)(self, _cmd, target, sel);
     if (link) {
-        if (!gameDisplayLinks) gameDisplayLinks = [NSHashTable weakObjectsHashTable];
-        if (!displayLinkTargetsLog) displayLinkTargetsLog = [NSMutableArray array];
-        [gameDisplayLinks addObject:link];
-        [displayLinkTargetsLog addObject:[NSString stringWithFormat:@"%@::%@", NSStringFromClass([target class]), NSStringFromSelector(sel)]];
+        NSString *targetName = NSStringFromClass([target class]);
+        if ([targetName isEqualToString:@"CCDirectorCaller"]) {
+            // Hủy DisplayLink cũ của CCDirectorCaller nếu tồn tại để chống trùng lặp nhịp vẽ (70-80 FPS)
+            CADisplayLink *prev = activeDirectorLink;
+            if (prev && prev != link) {
+                [prev invalidate];
+            }
+            activeDirectorLink = link;
+        }
         lockLinkTo120(link);
     }
     return link;
 }
 
 static void hooked_addToRunLoop(id self, SEL _cmd, NSRunLoop *runloop, NSRunLoopMode mode) {
-    NSRunLoopMode targetMode = isLoadingFinished ? NSRunLoopCommonModes : mode;
+    NSRunLoopMode targetMode = isBootComplete ? NSRunLoopCommonModes : mode;
     if (orig_addToRunLoop) {
         ((void (*)(id, SEL, NSRunLoop *, NSRunLoopMode))orig_addToRunLoop)(self, _cmd, runloop, targetMode);
     }
@@ -146,41 +108,15 @@ static void hooked_setFrameInterval(id self, SEL _cmd, NSInteger interval) {
 }
 
 static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
-    double targetInterval = (1.0 / 120.0);
     if (orig_setAnimationInterval) {
-        ((void (*)(id, SEL, double))orig_setAnimationInterval)(self, _cmd, targetInterval);
+        ((void (*)(id, SEL, double))orig_setAnimationInterval)(self, _cmd, (1.0 / 120.0));
     }
-    for (CADisplayLink *link in gameDisplayLinks) {
-        lockLinkTo120(link);
+    if (activeDirectorLink) {
+        lockLinkTo120(activeDirectorLink);
     }
 }
 
-// 3. Đo thời gian khung hình thực tế tại điểm xuất hình OpenGL ES (presentRenderbuffer:)
-static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
-    uint64_t now = mach_absolute_time();
-    if (lastFrameTimestamp > 0) {
-        double deltaMs = machTicksToMs(now - lastFrameTimestamp);
-        if (deltaMs < minFrameDeltaMs) minFrameDeltaMs = deltaMs;
-        if (deltaMs > maxFrameDeltaMs) maxFrameDeltaMs = deltaMs;
-    }
-    lastFrameTimestamp = now;
-    presentedFramesCount++;
-
-    if (lastMeasureTime == 0) {
-        lastMeasureTime = now;
-    } else {
-        double elapsedMs = machTicksToMs(now - lastMeasureTime);
-        if (elapsedMs >= 1000.0) {
-            measuredRealFPS = (double)presentedFramesCount * 1000.0 / elapsedMs;
-            presentedFramesCount = 0;
-            lastMeasureTime = now;
-        }
-    }
-
-    return orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
-}
-
-// 4. Tối ưu VRAM & Metal Layer
+// 3. Tối ưu VRAM & Double Buffering chuẩn (chống nghẽn hàng đợi presentRenderbuffer)
 static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
     NSMutableDictionary *optProps = props ? [NSMutableDictionary dictionaryWithDictionary:props] : [NSMutableDictionary dictionary];
     optProps[@"EAGLDrawablePropertyRetainedBacking"] = @NO;
@@ -202,12 +138,12 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
             metalLayer.framebufferOnly = YES;
         }
         if ([metalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) {
-            metalLayer.maximumDrawableCount = 3;
+            metalLayer.maximumDrawableCount = 2;
         }
     }
 }
 
-// 5. Chặn điều tiết năng lượng & cảnh báo nhiệt
+// 4. Chặn điều tiết năng lượng & cảnh báo nhiệt nhẹ
 static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) {
     return NO;
 }
@@ -220,39 +156,9 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     return realState;
 }
 
-// 6. Xuất báo cáo đo đạc chính xác điểm nghẽn 70-80 FPS
-static void dumpFramePacingLog(void) {
-    double vsyncHz = 0.0;
-    CADisplayLink *firstLink = [[gameDisplayLinks allObjects] firstObject];
-    if (firstLink && firstLink.duration > 0) {
-        vsyncHz = 1.0 / firstLink.duration;
-    }
-
-    NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== ĐO ĐẠC FRAME PACING (70-80 FPS DEBUG) ===\n"];
-    [msg appendFormat:@"- FPS xuất hình thực tế (presentRenderbuffer): %.1f FPS\n", measuredRealFPS];
-    [msg appendFormat:@"- Frame Time Min / Max: %.2f ms / %.2f ms (Chuẩn 120Hz = 8.33 ms)\n", minFrameDeltaMs, maxFrameDeltaMs];
-    [msg appendFormat:@"- Nhịp VSync WindowServer cấp: %.1f Hz | Số DisplayLink active: %lu\n", vsyncHz, (unsigned long)gameDisplayLinks.count];
-    [msg appendFormat:@"- Danh sách Target của DisplayLink: %@\n", [displayLinkTargetsLog componentsJoinedByString:@", "]];
-    [msg appendFormat:@"- QoS luồng chính hiện tại: %d\n", qos_class_self()];
-    [msg appendString:@"=============================================="];
-    writeDebugLog(msg);
-
-    // Reset min/max cho chu kỳ đo tiếp theo
-    minFrameDeltaMs = 999.0;
-    maxFrameDeltaMs = 0.0;
-}
-
 %ctor {
     @autoreleasepool {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (paths.count > 0) {
-            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
-            [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
-        }
-        writeDebugLog(@"Khởi động FPSBooster Debug (Đo đạc 70-80 FPS)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -288,12 +194,6 @@ static void dumpFramePacingLog(void) {
             if (mDrawProps) orig_setDrawableProperties = method_setImplementation(mDrawProps, (IMP)hooked_setDrawableProperties);
         }
 
-        Class eaglContextClass = NSClassFromString(@"EAGLContext");
-        if (eaglContextClass) {
-            Method mPresent = class_getInstanceMethod(eaglContextClass, @selector(presentRenderbuffer:));
-            if (mPresent) orig_presentRenderbuffer = method_setImplementation(mPresent, (IMP)hooked_presentRenderbuffer);
-        }
-
         Class metalLayerClass = [CAMetalLayer class];
         if (metalLayerClass) {
             Method mMetalLayout = class_getInstanceMethod(metalLayerClass, @selector(layoutSublayers));
@@ -317,23 +217,13 @@ static void dumpFramePacingLog(void) {
             }
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            isLoadingFinished = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            isBootComplete = YES;
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
-
-            NSRunLoop *mainLoop = [NSRunLoop mainRunLoop];
-            for (CADisplayLink *link in gameDisplayLinks) {
-                if (orig_addToRunLoop) {
-                    ((void (*)(id, SEL, NSRunLoop *, NSRunLoopMode))orig_addToRunLoop)(link, @selector(addToRunLoop:forMode:), mainLoop, NSRunLoopCommonModes);
-                }
-                lockLinkTo120(link);
+            if (activeDirectorLink) {
+                lockLinkTo120(activeDirectorLink);
             }
-
-            // Ghi log 3 lần cách nhau 4 giây để bắt trọn thông số trong bài chơi
-            [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                dumpFramePacingLog();
-            }];
         });
     }
 }
