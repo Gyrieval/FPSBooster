@@ -212,12 +212,11 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
+// Gọi [CATransaction flush] ngay từ frame đầu tiên (không chờ isBootComplete) như bản 23:19-23:20
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
-    if (isBootComplete) {
-        [CATransaction flush];
-    }
+    [CATransaction flush];
     uint64_t t1 = mach_absolute_time();
 
     presentCount++;
@@ -239,11 +238,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO FIX MÀN ĐEN + DIRECT FLUSH ===\n"];
+    [msg appendString:@"=== BÁO CÁO IMMEDIATE FLUSH (120HZ CHECK) ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Lệnh presentRenderbuffer + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"=========================================="];
+    [msg appendString:@"============================================="];
     writeDebugLog(msg);
 }
 
@@ -256,7 +255,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Fix màn đen + Direct Flush + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Immediate Flush + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
