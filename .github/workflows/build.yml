@@ -1,0 +1,34 @@
+name: Build FPSBooster Dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Theos and SDK
+        run: |
+          git clone --recursive https://github.com/theos/theos.git $HOME/theos
+          curl -sL https://github.com/xybp888/iOS-SDKs/releases/download/iOS-SDKs/iPhoneOS14.5.sdk.tar.xz -o sdk.tar.xz
+          mkdir -p $HOME/theos/sdks
+          tar -xf sdk.tar.xz -C $HOME/theos/sdks
+
+      - name: Build .dylib
+        env:
+          THEOS: ${{ env.HOME }}/theos
+        run: |
+          make package FINALPACKAGE=1
+          mkdir -p output
+          find .theos -name "*.dylib" -exec cp {} output/ \;
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FPSBooster-dylib
+          path: output/*.dylib
