@@ -3,7 +3,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <pthread.h>
-#import <mach/mach_time.h>
 
 #define TARGET_FPS 120
 
@@ -17,96 +16,16 @@ static IMP orig_displayLinkWithTarget = NULL;
 static IMP orig_screenDisplayLinkWithTarget = NULL;
 static IMP orig_addToRunLoop = NULL;
 static IMP orig_setAnimationInterval = NULL;
-static IMP orig_doCaller = NULL;
-static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_metalLayoutSublayers = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
 
-static NSHashTable *directorDisplayLinks = nil;
-static __weak id activeDirectorCaller = nil;
+static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
-static dispatch_source_t precision120HzTimer = nil;
-static CADisplayLink *keepAliveDummyLink = nil;
-static BOOL isPrecisionTimerActive = NO;
+static BOOL isBootComplete = NO;
 
-// Biến đo đạc
-static NSString *logFilePath = nil;
-static NSInteger timerTickCount = 0;
-static NSInteger dummyLinkTickCount = 0;
-static NSInteger presentCount = 0;
-static double measuredTimerHz = 0.0;
-static double measuredDummyHz = 0.0;
-static double measuredPresentFPS = 0.0;
-static double avgPresentCostMs = 0.0;
-static double accumulatedPresentMs = 0.0;
-static uint64_t lastSampleTicks = 0;
-
-@interface FPSKeepAliveTarget : NSObject
-@end
-
-@implementation FPSKeepAliveTarget
-- (void)onDummyTick:(CADisplayLink *)sender {
-    dummyLinkTickCount++;
-}
-@end
-
-static FPSKeepAliveTarget *dummyTarget = nil;
-
-static void writeDebugLog(NSString *message) {
-    if (!logFilePath) {
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (paths.count > 0) {
-            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
-        }
-    }
-    if (!logFilePath) return;
-
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    [fmt setDateFormat:@"HH:mm:ss.SSS"];
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], message];
-
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
-    if (fh) {
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } else {
-        [line writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-}
-
-static inline double machTicksToMs(uint64_t ticks) {
-    static mach_timebase_info_data_t timebase;
-    if (timebase.denom == 0) {
-        mach_timebase_info(&timebase);
-    }
-    return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
-}
-
-static void updateCounters(void) {
-    uint64_t now = mach_absolute_time();
-    if (lastSampleTicks == 0) {
-        lastSampleTicks = now;
-        return;
-    }
-    double elapsedMs = machTicksToMs(now - lastSampleTicks);
-    if (elapsedMs >= 1000.0) {
-        measuredTimerHz = (double)timerTickCount * 1000.0 / elapsedMs;
-        measuredDummyHz = (double)dummyLinkTickCount * 1000.0 / elapsedMs;
-        measuredPresentFPS = (double)presentCount * 1000.0 / elapsedMs;
-        avgPresentCostMs = (presentCount > 0) ? (accumulatedPresentMs / (double)presentCount) : 0.0;
-
-        timerTickCount = 0;
-        dummyLinkTickCount = 0;
-        presentCount = 0;
-        accumulatedPresentMs = 0.0;
-        lastSampleTicks = now;
-    }
-}
-
-// 1. Giả lập Info.plist trong RAM
+// 1. Giả lập Info.plist trong RAM cho các lớp kiểm tra nội bộ của game
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
     if ([key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"] ||
         [key isEqualToString:@"CADisableMinimumFrameDuration"]) {
@@ -135,7 +54,7 @@ static NSInteger hooked_maxFramesPerSecond(id self, SEL _cmd) {
     return TARGET_FPS;
 }
 
-// 2. Quản lý CADisplayLink & Precision 120Hz Timer
+// 2. Khóa nhịp CADisplayLink gốc ở 120 FPS (không can thiệp paused/invalidate)
 static inline void lockLinkTo120(CADisplayLink *link) {
     if (!link) return;
     if (@available(iOS 15.0, *)) {
@@ -149,37 +68,29 @@ static inline void lockLinkTo120(CADisplayLink *link) {
     }
 }
 
-static void handleNewDisplayLink(CADisplayLink *link, id target, SEL sel) {
+static void trackAndLockLink(CADisplayLink *link) {
     if (!link) return;
-    lockLinkTo120(link);
-
-    NSString *targetClass = NSStringFromClass([target class]);
-    if ([targetClass isEqualToString:@"CCDirectorCaller"]) {
-        activeDirectorCaller = target;
-        if (!directorDisplayLinks) {
-            directorDisplayLinks = [NSHashTable weakObjectsHashTable];
-        }
-        [directorDisplayLinks addObject:link];
-        if (isPrecisionTimerActive) {
-            link.paused = YES;
-        }
+    if (!gameDisplayLinks) {
+        gameDisplayLinks = [NSHashTable weakObjectsHashTable];
     }
+    [gameDisplayLinks addObject:link];
+    lockLinkTo120(link);
 }
 
 static CADisplayLink *hooked_displayLinkWithTarget(id self, SEL _cmd, id target, SEL sel) {
     CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))orig_displayLinkWithTarget)(self, _cmd, target, sel);
-    handleNewDisplayLink(link, target, sel);
+    trackAndLockLink(link);
     return link;
 }
 
 static CADisplayLink *hooked_screenDisplayLinkWithTarget(id self, SEL _cmd, id target, SEL sel) {
     CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))orig_screenDisplayLinkWithTarget)(self, _cmd, target, sel);
-    handleNewDisplayLink(link, target, sel);
+    trackAndLockLink(link);
     return link;
 }
 
 static void hooked_addToRunLoop(id self, SEL _cmd, NSRunLoop *runloop, NSRunLoopMode mode) {
-    NSRunLoopMode targetMode = isPrecisionTimerActive ? NSRunLoopCommonModes : mode;
+    NSRunLoopMode targetMode = isBootComplete ? NSRunLoopCommonModes : mode;
     if (orig_addToRunLoop) {
         ((void (*)(id, SEL, NSRunLoop *, NSRunLoopMode))orig_addToRunLoop)(self, _cmd, runloop, targetMode);
     }
@@ -202,67 +113,12 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     if (orig_setAnimationInterval) {
         ((void (*)(id, SEL, double))orig_setAnimationInterval)(self, _cmd, (1.0 / 120.0));
     }
-    if (isPrecisionTimerActive) {
-        for (CADisplayLink *link in directorDisplayLinks) {
-            link.paused = YES;
-        }
+    for (CADisplayLink *link in gameDisplayLinks) {
+        lockLinkTo120(link);
     }
 }
 
-static void hooked_doCaller(id self, SEL _cmd, id sender) {
-    activeDirectorCaller = self;
-    if (orig_doCaller) {
-        ((void (*)(id, SEL, id))orig_doCaller)(self, _cmd, sender);
-    }
-}
-
-static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
-    uint64_t t0 = mach_absolute_time();
-    BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
-    uint64_t t1 = mach_absolute_time();
-
-    presentCount++;
-    accumulatedPresentMs += machTicksToMs(t1 - t0);
-    updateCounters();
-    return res;
-}
-
-static void startPrecision120HzDriver(void) {
-    if (precision120HzTimer) return;
-    isPrecisionTimerActive = YES;
-
-    // 1. Giữ 1 DisplayLink rỗng luôn chạy để ngăn iOS bật Timer Coalescing 60Hz trên Main Queue
-    dummyTarget = [[FPSKeepAliveTarget alloc] init];
-    keepAliveDummyLink = [CADisplayLink displayLinkWithTarget:dummyTarget selector:@selector(onDummyTick:)];
-    lockLinkTo120(keepAliveDummyLink);
-    [keepAliveDummyLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-
-    // 2. Tạm dừng các DisplayLink 80Hz của CCDirectorCaller
-    for (CADisplayLink *link in directorDisplayLinks) {
-        link.paused = YES;
-    }
-
-    // 3. Khởi chạy Timer 120Hz chuẩn xác nanosecond với cờ DISPATCH_TIMER_STRICT
-    uint64_t intervalNs = (uint64_t)(1000000000ULL / TARGET_FPS);
-    precision120HzTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, dispatch_get_main_queue());
-    dispatch_source_set_timer(precision120HzTimer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, 0);
-
-    dispatch_source_set_event_handler(precision120HzTimer, ^{
-        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
-            return;
-        }
-        timerTickCount++;
-        updateCounters();
-        id caller = activeDirectorCaller;
-        if (caller && orig_doCaller) {
-            ((void (*)(id, SEL, id))orig_doCaller)(caller, @selector(doCaller:), nil);
-        }
-    });
-
-    dispatch_resume(precision120HzTimer);
-}
-
-// 3. Tối ưu VRAM & giữ Triple Buffering
+// 3. Tối ưu VRAM & giữ Triple Buffering cho OpenGL ES / Metal Translator
 static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
     NSMutableDictionary *optProps = props ? [NSMutableDictionary dictionaryWithDictionary:props] : [NSMutableDictionary dictionary];
     optProps[@"EAGLDrawablePropertyRetainedBacking"] = @NO;
@@ -277,39 +133,31 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
     }
     if ([self isKindOfClass:[CAMetalLayer class]]) {
         CAMetalLayer *metalLayer = (CAMetalLayer *)self;
-        if ([metalLayer respondsToSelector:@selector(setPresentsWithTransaction:)]) metalLayer.presentsWithTransaction = NO;
-        if ([metalLayer respondsToSelector:@selector(setFramebufferOnly:)]) metalLayer.framebufferOnly = YES;
-        if ([metalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) metalLayer.maximumDrawableCount = 3;
+        if ([metalLayer respondsToSelector:@selector(setPresentsWithTransaction:)]) {
+            metalLayer.presentsWithTransaction = NO;
+        }
+        if ([metalLayer respondsToSelector:@selector(setFramebufferOnly:)]) {
+            metalLayer.framebufferOnly = YES;
+        }
+        if ([metalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) {
+            metalLayer.maximumDrawableCount = 3;
+        }
     }
 }
 
-// 4. Chặn điều tiết năng lượng & cảnh báo nhiệt
-static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) { return NO; }
+// 4. Chặn điều tiết năng lượng & cảnh báo nhiệt mức nhẹ
+static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) {
+    return NO;
+}
 
 static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     NSProcessInfoThermalState realState = ((NSProcessInfoThermalState (*)(id, SEL))orig_thermalState)(self, _cmd);
     return (realState == NSProcessInfoThermalStateFair) ? NSProcessInfoThermalStateNominal : realState;
 }
 
-static void dumpVerificationLog(void) {
-    NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== KIỂM TRA CHỐNG TIMER COALESCING (120HZ STRICT) ===\n"];
-    [msg appendFormat:@"- Nhịp Strict Timer: %.1f Hz | Dummy DisplayLink giữ nhịp: %.1f Hz\n", measuredTimerHz, measuredDummyHz];
-    [msg appendFormat:@"- Lệnh presentRenderbuffer: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", measuredPresentFPS, avgPresentCostMs];
-    [msg appendString:@"===================================================="];
-    writeDebugLog(msg);
-}
-
 %ctor {
     @autoreleasepool {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (paths.count > 0) {
-            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
-            [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
-        }
-        writeDebugLog(@"Khởi động FPSBooster (Anti-Coalescing 120Hz Strict)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -349,12 +197,6 @@ static void dumpVerificationLog(void) {
             if (mDrawProps) orig_setDrawableProperties = method_setImplementation(mDrawProps, (IMP)hooked_setDrawableProperties);
         }
 
-        Class eaglContextClass = NSClassFromString(@"EAGLContext");
-        if (eaglContextClass) {
-            Method mPresent = class_getInstanceMethod(eaglContextClass, @selector(presentRenderbuffer:));
-            if (mPresent) orig_presentRenderbuffer = method_setImplementation(mPresent, (IMP)hooked_presentRenderbuffer);
-        }
-
         Class metalLayerClass = [CAMetalLayer class];
         if (metalLayerClass) {
             Method mMetalLayout = class_getInstanceMethod(metalLayerClass, @selector(layoutSublayers));
@@ -373,20 +215,16 @@ static void dumpVerificationLog(void) {
             if (directorCallerClass) {
                 Method mAnimInt = class_getInstanceMethod(directorCallerClass, NSSelectorFromString(@"setAnimationInterval:"));
                 if (mAnimInt) orig_setAnimationInterval = method_setImplementation(mAnimInt, (IMP)hooked_setAnimationInterval);
-
-                Method mDoCaller = class_getInstanceMethod(directorCallerClass, NSSelectorFromString(@"doCaller:"));
-                if (mDoCaller) orig_doCaller = method_setImplementation(mDoCaller, (IMP)hooked_doCaller);
             }
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            isBootComplete = YES;
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
-            startPrecision120HzDriver();
-
-            [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                dumpVerificationLog();
-            }];
+            for (CADisplayLink *link in gameDisplayLinks) {
+                lockLinkTo120(link);
+            }
         });
     }
 }
