@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <OpenGLES/ES2/gl.h>
 #import <objc/runtime.h>
 #import <pthread.h>
 #import <mach/mach_time.h>
@@ -20,15 +21,13 @@ static IMP orig_setAnimationInterval = NULL;
 static IMP orig_doCaller = NULL;
 static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_setDrawableProperties = NULL;
-static IMP orig_metalLayoutSublayers = NULL;
+static IMP orig_eaglLayoutSublayers = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
 
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
-static UIView *motionBoostView = nil;
-static NSString *motionBoostStatus = @"Chưa gắn";
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -83,7 +82,6 @@ static inline double machTicksToMs(uint64_t ticks) {
     return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
 }
 
-// 1. Giả lập Info.plist trong RAM
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
     if ([key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"] ||
         [key isEqualToString:@"CADisableMinimumFrameDuration"]) {
@@ -102,9 +100,7 @@ static NSDictionary *hooked_infoDictionary(id self, SEL _cmd) {
             cachedPatchedInfoDict = [mut copy];
         }
     }
-    if (self == [NSBundle mainBundle] && cachedPatchedInfoDict) {
-        return cachedPatchedInfoDict;
-    }
+    if (self == [NSBundle mainBundle] && cachedPatchedInfoDict) return cachedPatchedInfoDict;
     return orig_infoDictionary ? ((NSDictionary *(*)(id, SEL))orig_infoDictionary)(self, _cmd) : nil;
 }
 
@@ -112,7 +108,6 @@ static NSInteger hooked_maxFramesPerSecond(id self, SEL _cmd) {
     return TARGET_FPS;
 }
 
-// 2. Khóa nhịp CADisplayLink ở 120 FPS
 static inline void lockLinkTo120(CADisplayLink *link) {
     if (!link) return;
     if (@available(iOS 15.0, *)) {
@@ -128,9 +123,7 @@ static inline void lockLinkTo120(CADisplayLink *link) {
 
 static void trackAndLockLink(CADisplayLink *link) {
     if (!link) return;
-    if (!gameDisplayLinks) {
-        gameDisplayLinks = [NSHashTable weakObjectsHashTable];
-    }
+    if (!gameDisplayLinks) gameDisplayLinks = [NSHashTable weakObjectsHashTable];
     [gameDisplayLinks addObject:link];
     lockLinkTo120(link);
 }
@@ -163,9 +156,25 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     if (orig_setAnimationInterval) {
         ((void (*)(id, SEL, double))orig_setAnimationInterval)(self, _cmd, (1.0 / 120.0));
     }
-    for (CADisplayLink *link in gameDisplayLinks) {
-        lockLinkTo120(link);
+    for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
+}
+
+// Giữ nguyên hook layoutSublayers của CAEAGLLayer để duy trì Single-Layer Direct Scanout
+static void hooked_eaglLayoutSublayers(id self, SEL _cmd) {
+    if (orig_eaglLayoutSublayers) {
+        ((void (*)(id, SEL))orig_eaglLayoutSublayers)(self, _cmd);
     }
+    CALayer *layer = (CALayer *)self;
+    layer.opaque = YES;
+}
+
+static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
+    NSMutableDictionary *optProps = props ? [NSMutableDictionary dictionaryWithDictionary:props] : [NSMutableDictionary dictionary];
+    optProps[@"EAGLDrawablePropertyRetainedBacking"] = @NO;
+    if (orig_setDrawableProperties) {
+        ((void (*)(id, SEL, NSDictionary *))orig_setDrawableProperties)(self, _cmd, optProps);
+    }
+    ((CALayer *)self).opaque = YES;
 }
 
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
@@ -205,76 +214,12 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
-    if (isBootComplete) {
-        [CATransaction flush];
-    }
+    [CATransaction flush];
     uint64_t t1 = mach_absolute_time();
 
     presentCount++;
     accumPresentMs += machTicksToMs(t1 - t0);
     return res;
-}
-
-// 3. Kích hoạt UIKit CABasicAnimation 120Hz trên UIWindow để ép WindowServer giữ ProMotion 120Hz liên tục
-static void installUIKitMotionBoost(void) {
-    if (motionBoostView) return;
-
-    UIWindow *targetWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                if (w.isKeyWindow) {
-                    targetWindow = w;
-                    break;
-                }
-            }
-        }
-    }
-    if (!targetWindow) {
-        targetWindow = [UIApplication sharedApplication].windows.firstObject;
-    }
-    if (!targetWindow) {
-        motionBoostStatus = @"Lỗi: Không tìm thấy UIWindow";
-        return;
-    }
-
-    motionBoostView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 2, 2)];
-    motionBoostView.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.01];
-    motionBoostView.userInteractionEnabled = NO;
-    [targetWindow addSubview:motionBoostView];
-
-    CABasicAnimation *anim = [CABasicAnimation animationWithKeyPath:@"position.x"];
-    anim.fromValue = @(1.0);
-    anim.toValue = @(3.0);
-    anim.duration = 0.5;
-    anim.repeatCount = HUGE_VALF;
-    anim.autoreverses = YES;
-    if (@available(iOS 15.0, *)) {
-        anim.preferredFrameRateRange = CAFrameRateRangeMake(120.0f, 120.0f, 120.0f);
-    }
-    [motionBoostView.layer addAnimation:anim forKey:@"proMotion120Boost"];
-    motionBoostStatus = [NSString stringWithFormat:@"OK trên %@ (CABasicAnimation 120Hz)", NSStringFromClass([targetWindow class])];
-}
-
-// 4. Tối ưu VRAM & giữ Triple Buffering
-static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
-    NSMutableDictionary *optProps = props ? [NSMutableDictionary dictionaryWithDictionary:props] : [NSMutableDictionary dictionary];
-    optProps[@"EAGLDrawablePropertyRetainedBacking"] = @NO;
-    if (orig_setDrawableProperties) {
-        ((void (*)(id, SEL, NSDictionary *))orig_setDrawableProperties)(self, _cmd, optProps);
-    }
-}
-
-static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
-    if (orig_metalLayoutSublayers) {
-        ((void (*)(id, SEL))orig_metalLayoutSublayers)(self, _cmd);
-    }
-    if ([self isKindOfClass:[CAMetalLayer class]]) {
-        CAMetalLayer *metalLayer = (CAMetalLayer *)self;
-        if ([metalLayer respondsToSelector:@selector(setPresentsWithTransaction:)]) metalLayer.presentsWithTransaction = NO;
-        if ([metalLayer respondsToSelector:@selector(setFramebufferOnly:)]) metalLayer.framebufferOnly = YES;
-        if ([metalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) metalLayer.maximumDrawableCount = 3;
-    }
 }
 
 static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) { return NO; }
@@ -291,12 +236,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO UIKIT MOTION BOOST 120HZ ===\n"];
+    [msg appendString:@"=== BÁO CÁO SINGLE-LAYER EAGL + DIRECT FLUSH ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
-    [msg appendFormat:@"- Lệnh presentRenderbuffer: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
-    [msg appendFormat:@"- Trạng thái Motion Boost: %@\n", motionBoostStatus];
+    [msg appendFormat:@"- Lệnh presentRenderbuffer + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"======================================="];
+    [msg appendString:@"================================================"];
     writeDebugLog(msg);
 }
 
@@ -309,7 +253,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (UIKit Motion Boost 120Hz + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Single-Layer EAGL + Direct Flush + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -347,18 +291,15 @@ static void dumpDiagnosticLog(void) {
         if (eaglLayerClass) {
             Method mDrawProps = class_getInstanceMethod(eaglLayerClass, @selector(setDrawableProperties:));
             if (mDrawProps) orig_setDrawableProperties = method_setImplementation(mDrawProps, (IMP)hooked_setDrawableProperties);
+
+            Method mLayout = class_getInstanceMethod(eaglLayerClass, @selector(layoutSublayers));
+            if (mLayout) orig_eaglLayoutSublayers = method_setImplementation(mLayout, (IMP)hooked_eaglLayoutSublayers);
         }
 
         Class eaglContextClass = NSClassFromString(@"EAGLContext");
         if (eaglContextClass) {
             Method mPresent = class_getInstanceMethod(eaglContextClass, @selector(presentRenderbuffer:));
             if (mPresent) orig_presentRenderbuffer = method_setImplementation(mPresent, (IMP)hooked_presentRenderbuffer);
-        }
-
-        Class metalLayerClass = [CAMetalLayer class];
-        if (metalLayerClass) {
-            Method mMetalLayout = class_getInstanceMethod(metalLayerClass, @selector(layoutSublayers));
-            if (mMetalLayout) orig_metalLayoutSublayers = method_setImplementation(mMetalLayout, (IMP)hooked_metalLayoutSublayers);
         }
 
         Class processInfoClass = [NSProcessInfo class];
@@ -383,10 +324,7 @@ static void dumpDiagnosticLog(void) {
             isBootComplete = YES;
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
-            for (CADisplayLink *link in gameDisplayLinks) {
-                lockLinkTo120(link);
-            }
-            installUIKitMotionBoost();
+            for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
 
             [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
                 dumpDiagnosticLog();
