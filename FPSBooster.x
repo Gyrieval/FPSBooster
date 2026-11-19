@@ -27,6 +27,8 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
+static UIScrollView *proMotionScrollDriver = nil;
+static NSString *scrollDriverStatus = @"Chưa gắn";
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -178,6 +180,49 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
     }
 }
 
+// Chèn UIScrollView cuộn liên tục ở lớp dưới cùng (index 0) để kích hoạt chế độ ProMotion 120Hz Scroll/Touch Boost của iOS
+static void installProMotionScrollDriver(void) {
+    if (proMotionScrollDriver) return;
+
+    UIWindow *targetWindow = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                if (w.isKeyWindow) {
+                    targetWindow = w;
+                    break;
+                }
+            }
+        }
+    }
+    if (!targetWindow) {
+        targetWindow = [UIApplication sharedApplication].windows.firstObject;
+    }
+    if (!targetWindow) {
+        scrollDriverStatus = @"Lỗi: Không tìm thấy UIWindow";
+        return;
+    }
+
+    proMotionScrollDriver = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 0, 10, 10)];
+    proMotionScrollDriver.contentSize = CGSizeMake(10, 100000);
+    proMotionScrollDriver.userInteractionEnabled = NO;
+    proMotionScrollDriver.showsVerticalScrollIndicator = NO;
+    proMotionScrollDriver.showsHorizontalScrollIndicator = NO;
+    proMotionScrollDriver.backgroundColor = [UIColor clearColor];
+
+    // Đặt dưới cùng (index 0) để không đè lên CAEAGLLayer của game
+    [targetWindow insertSubview:proMotionScrollDriver atIndex:0];
+
+    [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+        CGFloat nextY = proMotionScrollDriver.contentOffset.y + 40.0;
+        if (nextY > 90000.0) nextY = 0.0;
+        [proMotionScrollDriver setContentOffset:CGPointMake(0, nextY) animated:YES];
+    }];
+
+    scrollDriverStatus = [NSString stringWithFormat:@"OK tại index 0 của %@", NSStringFromClass([targetWindow class])];
+}
+
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
     if ([sender isKindOfClass:[CADisplayLink class]]) {
         CADisplayLink *dl = (CADisplayLink *)sender;
@@ -212,7 +257,6 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// Gọi [CATransaction flush] ngay từ frame đầu tiên (không chờ isBootComplete) như bản 23:19-23:20
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
@@ -238,11 +282,12 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO IMMEDIATE FLUSH (120HZ CHECK) ===\n"];
+    [msg appendString:@"=== BÁO CÁO SCROLL-BOOST 120HZ + ASYNC LOG ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Lệnh presentRenderbuffer + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
+    [msg appendFormat:@"- Trạng thái Scroll Driver: %@\n", scrollDriverStatus];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"============================================="];
+    [msg appendString:@"=============================================="];
     writeDebugLog(msg);
 }
 
@@ -255,7 +300,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Immediate Flush + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Scroll-Boost 120Hz + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -330,6 +375,7 @@ static void dumpDiagnosticLog(void) {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
             for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
+            installProMotionScrollDriver();
 
             [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
                 dumpDiagnosticLog();
