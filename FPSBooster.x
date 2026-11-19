@@ -1,16 +1,13 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Metal/Metal.h>
 #import <OpenGLES/ES2/gl.h>
 #import <objc/runtime.h>
 #import <pthread.h>
-#import <mach/mach.h>
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-// Xả lệnh trước mốc VSync phần cứng 0.90 ms (900,000 ns) để trừ hao độ trễ IPC ~0.45ms lên WindowServer
-#define VSYNC_LEAD_NS 900000ULL
-#define VSYNC_PERIOD_NS 8333333ULL
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -34,7 +31,12 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
-static uint64_t hardwareTargetVSyncTicks = 0;
+
+// Metal 120Hz Client Driver gắn trực tiếp vào CAEAGLLayer
+static id<MTLDevice> sharedMetalDevice = nil;
+static id<MTLCommandQueue> sharedMetalQueue = nil;
+static CAMetalLayer *attachedMetalLayer = nil;
+static NSString *metalClientStatus = @"Chưa khởi tạo";
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -83,26 +85,10 @@ static void writeDebugLog(NSString *message) {
     });
 }
 
-static inline mach_timebase_info_data_t getMachTimebase(void) {
+static inline double machTicksToMs(uint64_t ticks) {
     static mach_timebase_info_data_t timebase;
     if (timebase.denom == 0) mach_timebase_info(&timebase);
-    return timebase;
-}
-
-static inline double machTicksToMs(uint64_t ticks) {
-    mach_timebase_info_data_t tb = getMachTimebase();
-    return (double)ticks * (double)tb.numer / (double)tb.denom / 1e6;
-}
-
-static inline uint64_t nsToMachTicks(uint64_t ns) {
-    mach_timebase_info_data_t tb = getMachTimebase();
-    return (ns * tb.denom) / tb.numer;
-}
-
-static inline uint64_t secondsToMachTicks(CFTimeInterval seconds) {
-    if (seconds <= 0.0) return 0;
-    uint64_t ns = (uint64_t)(seconds * 1e9);
-    return nsToMachTicks(ns);
+    return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
 }
 
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -182,6 +168,53 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
 }
 
+// Gắn CAMetalLayer 1x1 trong suốt trực tiếp vào CAEAGLLayer để kích hoạt chế độ Active Metal 120Hz Client của WindowServer
+static void attachMetal120ClientToEAGLLayer(CALayer *eaglLayer) {
+    if (!eaglLayer || !isBootComplete) return;
+    if (!sharedMetalDevice) {
+        sharedMetalDevice = MTLCreateSystemDefaultDevice();
+        if (sharedMetalDevice) sharedMetalQueue = [sharedMetalDevice newCommandQueue];
+    }
+    if (!sharedMetalDevice || !sharedMetalQueue) {
+        metalClientStatus = @"Lỗi: Không tạo được MTLDevice";
+        return;
+    }
+
+    if (!attachedMetalLayer) {
+        attachedMetalLayer = [CAMetalLayer layer];
+        attachedMetalLayer.device = sharedMetalDevice;
+        attachedMetalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        attachedMetalLayer.framebufferOnly = YES;
+        attachedMetalLayer.opaque = NO;
+        attachedMetalLayer.backgroundColor = [UIColor clearColor].CGColor;
+        attachedMetalLayer.frame = CGRectMake(0, 0, 1, 1);
+        attachedMetalLayer.drawableSize = CGSizeMake(1, 1);
+        if ([attachedMetalLayer respondsToSelector:@selector(setPresentsWithTransaction:)]) {
+            attachedMetalLayer.presentsWithTransaction = NO;
+        }
+        if ([attachedMetalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) {
+            attachedMetalLayer.maximumDrawableCount = 3;
+        }
+    }
+
+    if (attachedMetalLayer.superlayer != eaglLayer) {
+        [eaglLayer addSublayer:attachedMetalLayer];
+        metalClientStatus = @"OK (CAMetalLayer gắn trực tiếp trên CAEAGLLayer)";
+    }
+}
+
+static void pumpMetal120Heartbeat(void) {
+    if (!attachedMetalLayer || !sharedMetalQueue || !attachedMetalLayer.superlayer) return;
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = [attachedMetalLayer nextDrawable];
+        if (drawable) {
+            id<MTLCommandBuffer> cmdBuf = [sharedMetalQueue commandBuffer];
+            [cmdBuf presentDrawable:drawable];
+            [cmdBuf commit];
+        }
+    }
+}
+
 static void primeEAGLLayerDynamicState(CALayer *layer) {
     if (!layer) return;
     if (layer.contentsScale > 2.0 && orig_eaglSetContentsScale) {
@@ -198,6 +231,8 @@ static void primeEAGLLayerDynamicState(CALayer *layer) {
             [layer setValue:@YES forKey:@"lowLatency"];
         }
     } @catch (NSException *e) {}
+
+    attachMetal120ClientToEAGLLayer(layer);
 }
 
 static void hooked_eaglSetContentsScale(id self, SEL _cmd, CGFloat scale) {
@@ -238,9 +273,6 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
     if ([sender isKindOfClass:[CADisplayLink class]]) {
         CADisplayLink *dl = (CADisplayLink *)sender;
-        if (dl.targetTimestamp > 0.0) {
-            hardwareTargetVSyncTicks = secondsToMachTicks(dl.targetTimestamp);
-        }
         if (lastVsyncTimestamp > 0.0 && dl.timestamp > lastVsyncTimestamp) {
             accumVsyncDeltaMs += (dl.timestamp - lastVsyncTimestamp) * 1000.0;
         }
@@ -275,21 +307,10 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
-
-    if (isBootComplete && hardwareTargetVSyncTicks > 0) {
-        uint64_t leadTicks = nsToMachTicks(VSYNC_LEAD_NS);
-        uint64_t maxWaitTicks = nsToMachTicks(VSYNC_PERIOD_NS);
-        uint64_t now = mach_absolute_time();
-
-        if (hardwareTargetVSyncTicks > leadTicks) {
-            uint64_t wakeTicks = hardwareTargetVSyncTicks - leadTicks;
-            if (wakeTicks > now && (wakeTicks - now) < maxWaitTicks) {
-                mach_wait_until(wakeTicks);
-            }
-        }
-    }
-
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
+    if (isBootComplete) {
+        pumpMetal120Heartbeat();
+    }
     [CATransaction flush];
     uint64_t t1 = mach_absolute_time();
 
@@ -312,11 +333,12 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO VSYNC LEAD 0.90MS (120HZ LOCK) ===\n"];
+    [msg appendString:@"=== BÁO CÁO ACTIVE METAL CLIENT 120HZ + ASYNC LOG ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
+    [msg appendFormat:@"- Metal Client: %@\n", metalClientStatus];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"=============================================="];
+    [msg appendString:@"====================================================="];
     writeDebugLog(msg);
 }
 
@@ -329,7 +351,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (VSync Lead 0.90ms + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Active Metal Client 120Hz + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
