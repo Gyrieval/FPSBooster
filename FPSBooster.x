@@ -4,13 +4,9 @@
 #import <OpenGLES/ES2/gl.h>
 #import <objc/runtime.h>
 #import <pthread.h>
-#import <mach/mach.h>
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-// Giữ nhịp đẩy 8.28 ms đã chứng minh khóa 118-120 FPS ở bản 00:07
-#define TARGET_PACING_NS 8280000ULL
-#define MAX_DRIFT_NS     8333333ULL
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -33,7 +29,6 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
-static uint64_t nextFrameDeadlineTicks = 0;
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -82,20 +77,10 @@ static void writeDebugLog(NSString *message) {
     });
 }
 
-static inline mach_timebase_info_data_t getMachTimebase(void) {
+static inline double machTicksToMs(uint64_t ticks) {
     static mach_timebase_info_data_t timebase;
     if (timebase.denom == 0) mach_timebase_info(&timebase);
-    return timebase;
-}
-
-static inline double machTicksToMs(uint64_t ticks) {
-    mach_timebase_info_data_t tb = getMachTimebase();
-    return (double)ticks * (double)tb.numer / (double)tb.denom / 1e6;
-}
-
-static inline uint64_t nsToMachTicks(uint64_t ns) {
-    mach_timebase_info_data_t tb = getMachTimebase();
-    return (ns * tb.denom) / tb.numer;
+    return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
 }
 
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -256,29 +241,10 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// Soft Phase-Glide 8.28ms: giữ nhịp 118-120 FPS của bản 00:07 và trượt pha mượt không trôi sau 30s
+// Single-Flush + glFlush: không chặn Main Thread, chi phí GPU ~0.3-0.5 ms/lệnh
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
-
-    if (isBootComplete) {
-        uint64_t intervalTicks = nsToMachTicks(TARGET_PACING_NS);
-        uint64_t maxDriftTicks = nsToMachTicks(MAX_DRIFT_NS);
-        uint64_t now = mach_absolute_time();
-
-        if (nextFrameDeadlineTicks == 0 || now > nextFrameDeadlineTicks + maxDriftTicks) {
-            nextFrameDeadlineTicks = now + intervalTicks;
-        } else {
-            if (now < nextFrameDeadlineTicks) {
-                mach_wait_until(nextFrameDeadlineTicks);
-                nextFrameDeadlineTicks += intervalTicks;
-            } else {
-                // Nếu deadline vừa trôi qua nhẹ (< 8.33ms), trượt pha mềm về mốc now + intervalTicks thay vì tích lũy độ trễ
-                nextFrameDeadlineTicks = now + intervalTicks;
-            }
-        }
-    }
-
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
     [CATransaction flush];
     uint64_t t1 = mach_absolute_time();
@@ -302,7 +268,7 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO SOFT PHASE-GLIDE 118-120HZ + LOG ===\n"];
+    [msg appendString:@"=== BÁO CÁO SINGLE-FLUSH + 2X SCALE (STABLE) ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
@@ -319,7 +285,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Soft Phase-Glide 118-120Hz + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Single-Flush + 2x Scale + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
