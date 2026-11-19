@@ -13,6 +13,7 @@ static IMP orig_setPreferredFramesPerSecond = NULL;
 static IMP orig_setPreferredFrameRateRange = NULL;
 static IMP orig_setFrameInterval = NULL;
 static IMP orig_displayLinkWithTarget = NULL;
+static IMP orig_addToRunLoop = NULL;
 static IMP orig_setAnimationInterval = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_metalLayoutSublayers = NULL;
@@ -21,6 +22,7 @@ static IMP orig_thermalState = NULL;
 
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
+static BOOL isLoadingFinished = NO;
 
 // 1. Giả lập Info.plist trong RAM (Cache 1 lần duy nhất)
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -54,7 +56,7 @@ static NSInteger hooked_maxFramesPerSecond(id self, SEL _cmd) {
     return TARGET_FPS;
 }
 
-// 2. Khóa nhịp CADisplayLink ở 120 FPS (gỡ bỏ hook addToRunLoop để không làm kẹt luồng Loading)
+// 2. Khóa nhịp CADisplayLink ở 120 FPS
 static inline void lockLinkTo120(CADisplayLink *link) {
     if (!link) return;
     if (@available(iOS 15.0, *)) {
@@ -80,6 +82,15 @@ static CADisplayLink *hooked_displayLinkWithTarget(id self, SEL _cmd, id target,
     return link;
 }
 
+// Chỉ chuyển sang NSRunLoopCommonModes sau khi màn hình Loading đã nạp xong (tránh kẹt Loading)
+static void hooked_addToRunLoop(id self, SEL _cmd, NSRunLoop *runloop, NSRunLoopMode mode) {
+    NSRunLoopMode targetMode = isLoadingFinished ? NSRunLoopCommonModes : mode;
+    if (orig_addToRunLoop) {
+        ((void (*)(id, SEL, NSRunLoop *, NSRunLoopMode))orig_addToRunLoop)(self, _cmd, runloop, targetMode);
+    }
+    lockLinkTo120((CADisplayLink *)self);
+}
+
 static void hooked_setPreferredFramesPerSecond(id self, SEL _cmd, NSInteger fps) {
     lockLinkTo120((CADisplayLink *)self);
 }
@@ -92,7 +103,7 @@ static void hooked_setFrameInterval(id self, SEL _cmd, NSInteger interval) {
     lockLinkTo120((CADisplayLink *)self);
 }
 
-// 3. Gọi lại hàm gốc setAnimationInterval: với tham số 1.0/120.0 để CCDirectorCaller chuyển cảnh bình thường
+// 3. Giữ nhịp CCDirectorCaller ở 1.0/120.0 mà vẫn gọi hàm gốc để chuyển cảnh bình thường
 static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     double targetInterval = (1.0 / 120.0);
     if (orig_setAnimationInterval) {
@@ -161,6 +172,9 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
         Method mCreate = class_getClassMethod(displayLinkClass, @selector(displayLinkWithTarget:selector:));
         if (mCreate) orig_displayLinkWithTarget = method_setImplementation(mCreate, (IMP)hooked_displayLinkWithTarget);
 
+        Method mAddRunLoop = class_getInstanceMethod(displayLinkClass, @selector(addToRunLoop:forMode:));
+        if (mAddRunLoop) orig_addToRunLoop = method_setImplementation(mAddRunLoop, (IMP)hooked_addToRunLoop);
+
         Method mFps = class_getInstanceMethod(displayLinkClass, @selector(setPreferredFramesPerSecond:));
         if (mFps) orig_setPreferredFramesPerSecond = method_setImplementation(mFps, (IMP)hooked_setPreferredFramesPerSecond);
 
@@ -192,15 +206,27 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
         if (mThermal) orig_thermalState = method_setImplementation(mThermal, (IMP)hooked_thermalState);
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-            [UIApplication sharedApplication].idleTimerDisabled = YES;
-
             Class directorCallerClass = NSClassFromString(@"CCDirectorCaller");
             if (directorCallerClass) {
                 Method mAnimInt = class_getInstanceMethod(directorCallerClass, NSSelectorFromString(@"setAnimationInterval:"));
                 if (mAnimInt) {
                     orig_setAnimationInterval = method_setImplementation(mAnimInt, (IMP)hooked_setAnimationInterval);
                 }
+            }
+        });
+
+        // Sau 5 giây (khi màn hình Loading đã nạp xong), kích hoạt NSRunLoopCommonModes và ép lại tất cả DisplayLink lên 120Hz
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            isLoadingFinished = YES;
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            [UIApplication sharedApplication].idleTimerDisabled = YES;
+
+            NSRunLoop *mainLoop = [NSRunLoop mainRunLoop];
+            for (CADisplayLink *link in gameDisplayLinks) {
+                if (orig_addToRunLoop) {
+                    ((void (*)(id, SEL, NSRunLoop *, NSRunLoopMode))orig_addToRunLoop)(link, @selector(addToRunLoop:forMode:), mainLoop, NSRunLoopCommonModes);
+                }
+                lockLinkTo120(link);
             }
         });
     }
