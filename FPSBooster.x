@@ -1,10 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <pthread.h>
-#import <mach/mach_time.h>
 
 #define TARGET_FPS 120
 
@@ -18,115 +16,17 @@ static IMP orig_displayLinkWithTarget = NULL;
 static IMP orig_screenDisplayLinkWithTarget = NULL;
 static IMP orig_addToRunLoop = NULL;
 static IMP orig_setAnimationInterval = NULL;
+static IMP orig_doCaller = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_metalLayoutSublayers = NULL;
-static IMP orig_presentRenderbuffer = NULL;
-static IMP orig_doCaller = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
 
-static NSHashTable *gameDisplayLinks = nil;
+static NSHashTable *directorDisplayLinks = nil;
+static __weak id activeDirectorCaller = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
-static NSString *logFilePath = nil;
-static BOOL isBootComplete = NO;
-
-// Biến đo đạc chi tiết
-static NSInteger directorTicks = 0;
-static NSInteger presentTicks = 0;
-static NSInteger metalAnchorTicks = 0;
-static double fpsDirector = 0.0;
-static double fpsPresent = 0.0;
-static double fpsMetalAnchor = 0.0;
-static uint64_t lastSampleTime = 0;
-
-static double lastAnimIntervalRequested = -1.0;
-static BOOL anchorAttachedSuccess = NO;
-static NSString *anchorAttachDetail = @"Chưa gắn";
-static NSMutableArray *createdLinksLog = nil;
-
-static void writeDebugLog(NSString *message) {
-    if (!logFilePath) {
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (paths.count > 0) {
-            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
-        }
-    }
-    if (!logFilePath) return;
-
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    [fmt setDateFormat:@"HH:mm:ss.SSS"];
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], message];
-
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logFilePath];
-    if (fh) {
-        [fh seekToEndOfFile];
-        [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-        [fh closeFile];
-    } else {
-        [line writeToFile:logFilePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-}
-
-static inline double machTicksToMs(uint64_t ticks) {
-    static mach_timebase_info_data_t timebase;
-    if (timebase.denom == 0) {
-        mach_timebase_info(&timebase);
-    }
-    return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
-}
-
-@interface FPSProMotionAnchor : NSObject
-@property (nonatomic, strong) CAMetalLayer *anchorLayer;
-@property (nonatomic, strong) id<MTLCommandQueue> commandQueue;
-@property (nonatomic, strong) CADisplayLink *anchorLink;
-@end
-
-@implementation FPSProMotionAnchor
-- (void)startOnWindow:(UIWindow *)window {
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-    if (!device || !window) {
-        anchorAttachedSuccess = NO;
-        anchorAttachDetail = [NSString stringWithFormat:@"Lỗi: device=%p, window=%p", device, window];
-        return;
-    }
-
-    self.commandQueue = [device newCommandQueue];
-    self.anchorLayer = [CAMetalLayer layer];
-    self.anchorLayer.device = device;
-    self.anchorLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    self.anchorLayer.framebufferOnly = YES;
-    self.anchorLayer.drawableSize = CGSizeMake(4, 4);
-    self.anchorLayer.frame = CGRectMake(0, 0, 4, 4);
-    self.anchorLayer.opacity = 0.02f;
-    self.anchorLayer.presentsWithTransaction = NO;
-
-    [window.layer addSublayer:self.anchorLayer];
-
-    self.anchorLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tickMetalAnchor:)];
-    if (@available(iOS 15.0, *)) {
-        self.anchorLink.preferredFrameRateRange = CAFrameRateRangeMake(120.0f, 120.0f, 120.0f);
-    }
-    self.anchorLink.preferredFramesPerSecond = 120;
-    [self.anchorLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
-
-    anchorAttachedSuccess = YES;
-    anchorAttachDetail = [NSString stringWithFormat:@"OK trên %@ (frame: %@)", NSStringFromClass([window class]), NSStringFromCGRect(window.frame)];
-}
-
-- (void)tickMetalAnchor:(CADisplayLink *)sender {
-    metalAnchorTicks++;
-    @autoreleasepool {
-        id<CAMetalDrawable> drawable = [self.anchorLayer nextDrawable];
-        if (drawable && self.commandQueue) {
-            id<MTLCommandBuffer> cmdBuf = [self.commandQueue commandBuffer];
-            [cmdBuf presentDrawable:drawable];
-            [cmdBuf commit];
-        }
-    }
-}
-@end
-
-static FPSProMotionAnchor *globalAnchor = nil;
+static dispatch_source_t precision120HzTimer = nil;
+static BOOL isPrecisionTimerActive = NO;
 
 // 1. Giả lập Info.plist trong RAM
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -157,7 +57,7 @@ static NSInteger hooked_maxFramesPerSecond(id self, SEL _cmd) {
     return TARGET_FPS;
 }
 
-// 2. Khóa nhịp CADisplayLink (Bắt cả CADisplayLink và UIScreen)
+// 2. Quản lý CADisplayLink & chuyển giao nhịp sang Precision 120Hz Timer sau khi vào game
 static inline void lockLinkTo120(CADisplayLink *link) {
     if (!link) return;
     if (@available(iOS 15.0, *)) {
@@ -171,29 +71,37 @@ static inline void lockLinkTo120(CADisplayLink *link) {
     }
 }
 
-static void recordCreatedLink(CADisplayLink *link, NSString *source, id target, SEL sel) {
+static void handleNewDisplayLink(CADisplayLink *link, id target, SEL sel) {
     if (!link) return;
-    if (!gameDisplayLinks) gameDisplayLinks = [NSHashTable weakObjectsHashTable];
-    if (!createdLinksLog) createdLinksLog = [NSMutableArray array];
-    [gameDisplayLinks addObject:link];
-    [createdLinksLog addObject:[NSString stringWithFormat:@"[%@] %@::%@", source, NSStringFromClass([target class]), NSStringFromSelector(sel)]];
     lockLinkTo120(link);
+
+    NSString *targetClass = NSStringFromClass([target class]);
+    if ([targetClass isEqualToString:@"CCDirectorCaller"]) {
+        activeDirectorCaller = target;
+        if (!directorDisplayLinks) {
+            directorDisplayLinks = [NSHashTable weakObjectsHashTable];
+        }
+        [directorDisplayLinks addObject:link];
+        if (isPrecisionTimerActive) {
+            link.paused = YES;
+        }
+    }
 }
 
 static CADisplayLink *hooked_displayLinkWithTarget(id self, SEL _cmd, id target, SEL sel) {
     CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))orig_displayLinkWithTarget)(self, _cmd, target, sel);
-    recordCreatedLink(link, @"CADisplayLink", target, sel);
+    handleNewDisplayLink(link, target, sel);
     return link;
 }
 
 static CADisplayLink *hooked_screenDisplayLinkWithTarget(id self, SEL _cmd, id target, SEL sel) {
     CADisplayLink *link = ((CADisplayLink *(*)(id, SEL, id, SEL))orig_screenDisplayLinkWithTarget)(self, _cmd, target, sel);
-    recordCreatedLink(link, @"UIScreen", target, sel);
+    handleNewDisplayLink(link, target, sel);
     return link;
 }
 
 static void hooked_addToRunLoop(id self, SEL _cmd, NSRunLoop *runloop, NSRunLoopMode mode) {
-    NSRunLoopMode targetMode = isBootComplete ? NSRunLoopCommonModes : mode;
+    NSRunLoopMode targetMode = isPrecisionTimerActive ? NSRunLoopCommonModes : mode;
     if (orig_addToRunLoop) {
         ((void (*)(id, SEL, NSRunLoop *, NSRunLoopMode))orig_addToRunLoop)(self, _cmd, runloop, targetMode);
     }
@@ -213,49 +121,50 @@ static void hooked_setFrameInterval(id self, SEL _cmd, NSInteger interval) {
 }
 
 static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
-    lastAnimIntervalRequested = interval;
     if (orig_setAnimationInterval) {
         ((void (*)(id, SEL, double))orig_setAnimationInterval)(self, _cmd, (1.0 / 120.0));
     }
-    for (CADisplayLink *link in gameDisplayLinks) {
-        lockLinkTo120(link);
-    }
-}
-
-// 3. Đo tần số từng tầng: Metal Anchor vs CCDirectorCaller vs OpenGL Present
-static void updateFPSCountersIfNeeded(void) {
-    uint64_t now = mach_absolute_time();
-    if (lastSampleTime == 0) {
-        lastSampleTime = now;
-        return;
-    }
-    double elapsedMs = machTicksToMs(now - lastSampleTime);
-    if (elapsedMs >= 1000.0) {
-        fpsDirector = (double)directorTicks * 1000.0 / elapsedMs;
-        fpsPresent = (double)presentTicks * 1000.0 / elapsedMs;
-        fpsMetalAnchor = (double)metalAnchorTicks * 1000.0 / elapsedMs;
-        directorTicks = 0;
-        presentTicks = 0;
-        metalAnchorTicks = 0;
-        lastSampleTime = now;
+    if (isPrecisionTimerActive) {
+        for (CADisplayLink *link in directorDisplayLinks) {
+            link.paused = YES;
+        }
     }
 }
 
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
-    directorTicks++;
-    updateFPSCountersIfNeeded();
+    activeDirectorCaller = self;
     if (orig_doCaller) {
         ((void (*)(id, SEL, id))orig_doCaller)(self, _cmd, sender);
     }
 }
 
-static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
-    presentTicks++;
-    updateFPSCountersIfNeeded();
-    return orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
+// Khởi chạy bộ kích nhịp 120Hz (8.333ms) độc lập với trần 80Hz của WindowServer
+static void startPrecision120HzDriver(void) {
+    if (precision120HzTimer) return;
+    isPrecisionTimerActive = YES;
+
+    for (CADisplayLink *link in directorDisplayLinks) {
+        link.paused = YES;
+    }
+
+    uint64_t intervalNs = (uint64_t)(1000000000ULL / TARGET_FPS); // 8,333,333 ns = 120.0 Hz
+    precision120HzTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_set_timer(precision120HzTimer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, 0);
+
+    dispatch_source_set_event_handler(precision120HzTimer, ^{
+        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) {
+            return;
+        }
+        id caller = activeDirectorCaller;
+        if (caller && orig_doCaller) {
+            ((void (*)(id, SEL, id))orig_doCaller)(caller, @selector(doCaller:), nil);
+        }
+    });
+
+    dispatch_resume(precision120HzTimer);
 }
 
-// 4. VRAM & Low Power / Thermal
+// 3. Tối ưu VRAM & giữ Triple Buffering
 static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
     NSMutableDictionary *optProps = props ? [NSMutableDictionary dictionaryWithDictionary:props] : [NSMutableDictionary dictionary];
     optProps[@"EAGLDrawablePropertyRetainedBacking"] = @NO;
@@ -276,6 +185,7 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
     }
 }
 
+// 4. Chặn điều tiết năng lượng & cảnh báo nhiệt
 static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) { return NO; }
 
 static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
@@ -283,44 +193,9 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     return (realState == NSProcessInfoThermalStateFair) ? NSProcessInfoThermalStateNominal : realState;
 }
 
-static void dumpDeepDiagnosticLog(void) {
-    id plistVal = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CADisableMinimumFrameDurationOnPhone"];
-    NSInteger screenMax = [UIScreen mainScreen].maximumFramesPerSecond;
-
-    NSMutableArray *linksDetail = [NSMutableArray array];
-    for (CADisplayLink *link in gameDisplayLinks) {
-        double durHz = (link.duration > 0) ? (1.0 / link.duration) : 0.0;
-        NSInteger prefFps = link.preferredFramesPerSecond;
-        float minR = 0, maxR = 0, prefR = 0;
-        if (@available(iOS 15.0, *)) {
-            CAFrameRateRange r = link.preferredFrameRateRange;
-            minR = r.minimum; maxR = r.maximum; prefR = r.preferred;
-        }
-        [linksDetail addObject:[NSString stringWithFormat:@"{paused:%d, durHz:%.1f, prefFPS:%ld, range:[%.0f-%.0f-%.0f]}",
-                                link.isPaused, durHz, (long)prefFps, minR, prefR, maxR]];
-    }
-
-    NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== CHẨN ĐOÁN SÂU 70-80 FPS (METAL ANCHOR + LIVECONTAINER) ===\n"];
-    [msg appendFormat:@"- Nhịp Metal Anchor: %.1f Hz | CCDirectorCaller: %.1f Hz | GPU Present: %.1f FPS\n", fpsMetalAnchor, fpsDirector, fpsPresent];
-    [msg appendFormat:@"- Trạng thái Metal Anchor: %@\n", anchorAttachDetail];
-    [msg appendFormat:@"- Bundle Key: %@ | UIScreen MaxFPS: %ld | Game yêu cầu Interval: %.5f\n", plistVal, (long)screenMax, lastAnimIntervalRequested];
-    [msg appendFormat:@"- Nguồn tạo DisplayLink: %@\n", [createdLinksLog componentsJoinedByString:@", "]];
-    [msg appendFormat:@"- Thuộc tính thực tế của DisplayLink: %@\n", [linksDetail componentsJoinedByString:@" | "]];
-    [msg appendString:@"============================================================="];
-    writeDebugLog(msg);
-}
-
 %ctor {
     @autoreleasepool {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (paths.count > 0) {
-            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
-            [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
-        }
-        writeDebugLog(@"Khởi động FPSBooster Deep Diagnostic...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -360,12 +235,6 @@ static void dumpDeepDiagnosticLog(void) {
             if (mDrawProps) orig_setDrawableProperties = method_setImplementation(mDrawProps, (IMP)hooked_setDrawableProperties);
         }
 
-        Class eaglContextClass = NSClassFromString(@"EAGLContext");
-        if (eaglContextClass) {
-            Method mPresent = class_getInstanceMethod(eaglContextClass, @selector(presentRenderbuffer:));
-            if (mPresent) orig_presentRenderbuffer = method_setImplementation(mPresent, (IMP)hooked_presentRenderbuffer);
-        }
-
         Class metalLayerClass = [CAMetalLayer class];
         if (metalLayerClass) {
             Method mMetalLayout = class_getInstanceMethod(metalLayerClass, @selector(layoutSublayers));
@@ -390,35 +259,11 @@ static void dumpDeepDiagnosticLog(void) {
             }
         });
 
+        // Sau 4.5 giây (khi game đã vào sảnh chính), tạm dừng DisplayLink 80Hz và bật Precision 120Hz Timer
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            isBootComplete = YES;
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
-
-            for (CADisplayLink *link in gameDisplayLinks) {
-                lockLinkTo120(link);
-            }
-
-            UIWindow *keyWindow = nil;
-            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-                if ([scene isKindOfClass:[UIWindowScene class]]) {
-                    for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                        if (w.isKeyWindow) {
-                            keyWindow = w;
-                            break;
-                        }
-                    }
-                }
-            }
-            if (!keyWindow) {
-                keyWindow = [UIApplication sharedApplication].windows.firstObject;
-            }
-            globalAnchor = [[FPSProMotionAnchor alloc] init];
-            [globalAnchor startOnWindow:keyWindow];
-
-            [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                dumpDeepDiagnosticLog();
-            }];
+            startPrecision120HzDriver();
         });
     }
 }
