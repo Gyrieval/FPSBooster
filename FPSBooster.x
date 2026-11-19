@@ -8,7 +8,8 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-#define TARGET_PACING_NS 8280000ULL
+// Khớp chính xác chu kỳ thạch anh phần cứng 120.000 Hz (1,000,000,000 / 120 = 8,333,333 ns)
+#define TARGET_PACING_NS 8333333ULL
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -245,9 +246,6 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
             statAvgVsyncDeltaMs = (frameCount > 0) ? (accumVsyncDeltaMs / (double)frameCount) : 0.0;
             statAvgPresentCostMs = (presentCount > 0) ? (accumPresentMs / (double)presentCount) : 0.0;
 
-            // Hiệu chỉnh lại pha mỗi giây để giữ chuỗi 118-120 FPS không trôi pha
-            nextFrameDeadlineTicks = 0;
-
             frameCount = 0;
             presentCount = 0;
             accumVsyncDeltaMs = 0.0;
@@ -257,7 +255,7 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// Auto-Reset Pacing 8.28ms + Single Flush (giữ 118-120 FPS liên tục không trôi pha)
+// Khóa nhịp thạch anh 8,333,333 ns (120.000 Hz) liên tục không ngắt nhịp
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
@@ -298,11 +296,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO AUTO-RESET PACING 118-120HZ + LOG ===\n"];
+    [msg appendString:@"=== BÁO CÁO QUARTZ 120.000HZ PACING + ASYNC LOG ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"=================================================="];
+    [msg appendString:@"===================================================="];
     writeDebugLog(msg);
 }
 
@@ -315,7 +313,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Auto-Reset Pacing 118-120Hz + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Quartz 120.000Hz Pacing + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
