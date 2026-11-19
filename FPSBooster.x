@@ -28,19 +28,31 @@ static NSHashTable *directorDisplayLinks = nil;
 static __weak id activeDirectorCaller = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static dispatch_source_t precision120HzTimer = nil;
+static CADisplayLink *keepAliveDummyLink = nil;
 static BOOL isPrecisionTimerActive = NO;
 
-// Biến ghi log thuần túy (không can thiệp luồng chạy)
+// Biến đo đạc
 static NSString *logFilePath = nil;
 static NSInteger timerTickCount = 0;
-static NSInteger doCallerCount = 0;
+static NSInteger dummyLinkTickCount = 0;
 static NSInteger presentCount = 0;
 static double measuredTimerHz = 0.0;
-static double measuredDoCallerHz = 0.0;
+static double measuredDummyHz = 0.0;
 static double measuredPresentFPS = 0.0;
 static double avgPresentCostMs = 0.0;
 static double accumulatedPresentMs = 0.0;
 static uint64_t lastSampleTicks = 0;
+
+@interface FPSKeepAliveTarget : NSObject
+@end
+
+@implementation FPSKeepAliveTarget
+- (void)onDummyTick:(CADisplayLink *)sender {
+    dummyLinkTickCount++;
+}
+@end
+
+static FPSKeepAliveTarget *dummyTarget = nil;
 
 static void writeDebugLog(NSString *message) {
     if (!logFilePath) {
@@ -82,12 +94,12 @@ static void updateCounters(void) {
     double elapsedMs = machTicksToMs(now - lastSampleTicks);
     if (elapsedMs >= 1000.0) {
         measuredTimerHz = (double)timerTickCount * 1000.0 / elapsedMs;
-        measuredDoCallerHz = (double)doCallerCount * 1000.0 / elapsedMs;
+        measuredDummyHz = (double)dummyLinkTickCount * 1000.0 / elapsedMs;
         measuredPresentFPS = (double)presentCount * 1000.0 / elapsedMs;
         avgPresentCostMs = (presentCount > 0) ? (accumulatedPresentMs / (double)presentCount) : 0.0;
 
         timerTickCount = 0;
-        doCallerCount = 0;
+        dummyLinkTickCount = 0;
         presentCount = 0;
         accumulatedPresentMs = 0.0;
         lastSampleTicks = now;
@@ -123,7 +135,7 @@ static NSInteger hooked_maxFramesPerSecond(id self, SEL _cmd) {
     return TARGET_FPS;
 }
 
-// 2. Quản lý CADisplayLink & chuyển giao nhịp sang Precision 120Hz Timer
+// 2. Quản lý CADisplayLink & Precision 120Hz Timer
 static inline void lockLinkTo120(CADisplayLink *link) {
     if (!link) return;
     if (@available(iOS 15.0, *)) {
@@ -199,8 +211,6 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
 
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
     activeDirectorCaller = self;
-    doCallerCount++;
-    updateCounters();
     if (orig_doCaller) {
         ((void (*)(id, SEL, id))orig_doCaller)(self, _cmd, sender);
     }
@@ -221,12 +231,20 @@ static void startPrecision120HzDriver(void) {
     if (precision120HzTimer) return;
     isPrecisionTimerActive = YES;
 
+    // 1. Giữ 1 DisplayLink rỗng luôn chạy để ngăn iOS bật Timer Coalescing 60Hz trên Main Queue
+    dummyTarget = [[FPSKeepAliveTarget alloc] init];
+    keepAliveDummyLink = [CADisplayLink displayLinkWithTarget:dummyTarget selector:@selector(onDummyTick:)];
+    lockLinkTo120(keepAliveDummyLink);
+    [keepAliveDummyLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+
+    // 2. Tạm dừng các DisplayLink 80Hz của CCDirectorCaller
     for (CADisplayLink *link in directorDisplayLinks) {
         link.paused = YES;
     }
 
+    // 3. Khởi chạy Timer 120Hz chuẩn xác nanosecond với cờ DISPATCH_TIMER_STRICT
     uint64_t intervalNs = (uint64_t)(1000000000ULL / TARGET_FPS);
-    precision120HzTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    precision120HzTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, DISPATCH_TIMER_STRICT, dispatch_get_main_queue());
     dispatch_source_set_timer(precision120HzTimer, dispatch_time(DISPATCH_TIME_NOW, 0), intervalNs, 0);
 
     dispatch_source_set_event_handler(precision120HzTimer, ^{
@@ -275,12 +293,10 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
 
 static void dumpVerificationLog(void) {
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== KIỂM TRA HOẠT ĐỘNG PRECISION 120HZ TIMER ===\n"];
-    [msg appendFormat:@"- Nhịp Timer bắn: %.1f Hz | CCDirectorCaller::doCaller: %.1f Hz\n", measuredTimerHz, measuredDoCallerHz];
-    [msg appendFormat:@"- Lệnh presentRenderbuffer: %.1f FPS (Thời gian trung bình mỗi lệnh: %.2f ms)\n", measuredPresentFPS, avgPresentCostMs];
-    [msg appendFormat:@"- Trạng thái Timer: %@ | Số DisplayLink đang tạm dừng: %lu\n",
-     isPrecisionTimerActive ? @"ĐANG CHẠY" : @"CHƯA CHẠY", (unsigned long)directorDisplayLinks.count];
-    [msg appendString:@"================================================"];
+    [msg appendString:@"=== KIỂM TRA CHỐNG TIMER COALESCING (120HZ STRICT) ===\n"];
+    [msg appendFormat:@"- Nhịp Strict Timer: %.1f Hz | Dummy DisplayLink giữ nhịp: %.1f Hz\n", measuredTimerHz, measuredDummyHz];
+    [msg appendFormat:@"- Lệnh presentRenderbuffer: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", measuredPresentFPS, avgPresentCostMs];
+    [msg appendString:@"===================================================="];
     writeDebugLog(msg);
 }
 
@@ -293,7 +309,7 @@ static void dumpVerificationLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Chế độ ghi log kiểm tra, giữ nguyên logic)...");
+        writeDebugLog(@"Khởi động FPSBooster (Anti-Coalescing 120Hz Strict)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
