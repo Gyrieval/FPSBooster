@@ -1,7 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <OpenGLES/ES2/gl.h>
 #import <objc/runtime.h>
 #import <pthread.h>
 #import <mach/mach_time.h>
@@ -28,20 +27,14 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
+
+// Biến ghi log FPS thuần túy (không can thiệp logic khung hình)
 static NSString *logFilePath = nil;
-
-// Biến đo hiệu năng chi tiết từng khung hình
-static NSInteger frameCount = 0;
-static double accumCpuFrameMs = 0.0;
-static double accumPresentMs = 0.0;
-static double accumVsyncDeltaMs = 0.0;
-static CFTimeInterval lastVsyncTimestamp = 0.0;
-
-static double statMeasuredFPS = 0.0;
-static double statAvgCpuMs = 0.0;
-static double statAvgPresentMs = 0.0;
-static double statAvgVsyncDeltaMs = 0.0;
-static uint64_t lastStatTicks = 0;
+static NSInteger doCallerTicks = 0;
+static NSInteger presentTicks = 0;
+static double measuredDoCallerHz = 0.0;
+static double measuredPresentFPS = 0.0;
+static uint64_t lastSampleTicks = 0;
 
 static void writeDebugLog(NSString *message) {
     if (!logFilePath) {
@@ -74,7 +67,22 @@ static inline double machTicksToMs(uint64_t ticks) {
     return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
 }
 
-// 1. Giả lập Info.plist trong RAM
+static void updateFPSCounters(void) {
+    uint64_t now = mach_absolute_time();
+    if (lastSampleTicks == 0) {
+        lastSampleTicks = now;
+        return;
+    }
+    double elapsedMs = machTicksToMs(now - lastSampleTicks);
+    if (elapsedMs >= 1000.0) {
+        measuredDoCallerHz = (double)doCallerTicks * 1000.0 / elapsedMs;
+        measuredPresentFPS = (double)presentTicks * 1000.0 / elapsedMs;
+        doCallerTicks = 0;
+        presentTicks = 0;
+        lastSampleTicks = now;
+    }
+}
+
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
     if ([key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"] ||
         [key isEqualToString:@"CADisableMinimumFrameDuration"]) {
@@ -103,7 +111,6 @@ static NSInteger hooked_maxFramesPerSecond(id self, SEL _cmd) {
     return TARGET_FPS;
 }
 
-// 2. Khóa nhịp CADisplayLink gốc ở 120 FPS
 static inline void lockLinkTo120(CADisplayLink *link) {
     if (!link) return;
     if (@available(iOS 15.0, *)) {
@@ -167,53 +174,20 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     }
 }
 
-// 3. Đo thời gian thực thi từng khung hình CPU & VSync Timestamp
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
-    if ([sender isKindOfClass:[CADisplayLink class]]) {
-        CADisplayLink *dl = (CADisplayLink *)sender;
-        if (lastVsyncTimestamp > 0.0 && dl.timestamp > lastVsyncTimestamp) {
-            accumVsyncDeltaMs += (dl.timestamp - lastVsyncTimestamp) * 1000.0;
-        }
-        lastVsyncTimestamp = dl.timestamp;
-    }
-
-    uint64_t t0 = mach_absolute_time();
+    doCallerTicks++;
+    updateFPSCounters();
     if (orig_doCaller) {
         ((void (*)(id, SEL, id))orig_doCaller)(self, _cmd, sender);
-    }
-    uint64_t t1 = mach_absolute_time();
-
-    frameCount++;
-    accumCpuFrameMs += machTicksToMs(t1 - t0);
-
-    if (lastStatTicks == 0) {
-        lastStatTicks = t1;
-    } else {
-        double elapsedMs = machTicksToMs(t1 - lastStatTicks);
-        if (elapsedMs >= 1000.0) {
-            statMeasuredFPS = (double)frameCount * 1000.0 / elapsedMs;
-            statAvgCpuMs = (frameCount > 0) ? (accumCpuFrameMs / (double)frameCount) : 0.0;
-            statAvgPresentMs = (frameCount > 0) ? (accumPresentMs / (double)frameCount) : 0.0;
-            statAvgVsyncDeltaMs = (frameCount > 0) ? (accumVsyncDeltaMs / (double)frameCount) : 0.0;
-
-            frameCount = 0;
-            accumCpuFrameMs = 0.0;
-            accumPresentMs = 0.0;
-            accumVsyncDeltaMs = 0.0;
-            lastStatTicks = t1;
-        }
     }
 }
 
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
-    uint64_t t0 = mach_absolute_time();
-    BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
-    uint64_t t1 = mach_absolute_time();
-    accumPresentMs += machTicksToMs(t1 - t0);
-    return res;
+    presentTicks++;
+    updateFPSCounters();
+    return orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
 }
 
-// 4. Tối ưu VRAM & giữ Triple Buffering
 static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
     NSMutableDictionary *optProps = props ? [NSMutableDictionary dictionaryWithDictionary:props] : [NSMutableDictionary dictionary];
     optProps[@"EAGLDrawablePropertyRetainedBacking"] = @NO;
@@ -241,49 +215,19 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     return (realState == NSProcessInfoThermalStateFair) ? NSProcessInfoThermalStateNominal : realState;
 }
 
-// Hàm quét cấu trúc Layer của UIWindow & kiểm tra Info.plist vật lý
-static void dumpFourLayerDiagnostics(void) {
-    // Kiểm tra Info.plist vật lý thực sự trên ổ đĩa của MainBundle (bỏ qua hook)
-    NSString *plistPath = [[NSBundle mainBundle] pathForResource:@"Info" ofType:@"plist"];
-    NSDictionary *diskPlist = plistPath ? [NSDictionary dictionaryWithContentsOfFile:plistPath] : nil;
-    id diskKeyVal = diskPlist[@"CADisableMinimumFrameDurationOnPhone"];
-    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier];
-
-    // Quét tất cả sublayer trong KeyWindow để xem game đang vẽ lên CAEAGLLayer hay CAMetalLayer
-    NSMutableArray *layerSummary = [NSMutableArray array];
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                NSMutableArray *queue = [NSMutableArray arrayWithObject:w.layer];
-                while (queue.count > 0) {
-                    CALayer *curr = queue.firstObject;
-                    [queue removeObjectAtIndex:0];
-                    NSString *clsName = NSStringFromClass([curr class]);
-                    if ([clsName containsString:@"EAGL"] || [clsName containsString:@"Metal"]) {
-                        BOOL asyncPresent = NO;
-                        if ([curr respondsToSelector:@selector(presentsWithTransaction)]) {
-                            asyncPresent = !((CAMetalLayer *)curr).presentsWithTransaction;
-                        }
-                        [layerSummary addObject:[NSString stringWithFormat:@"%@(%.0fx%.0f, async:%d)",
-                                                 clsName, curr.bounds.size.width, curr.bounds.size.height, asyncPresent]];
-                    }
-                    if (curr.sublayers) [queue addObjectsFromArray:curr.sublayers];
-                }
-            }
-        }
+static void dumpFPSVerificationLog(void) {
+    NSMutableArray *linksInfo = [NSMutableArray array];
+    for (CADisplayLink *link in gameDisplayLinks) {
+        double hz = (link.duration > 0) ? (1.0 / link.duration) : 0.0;
+        [linksInfo addObject:[NSString stringWithFormat:@"[paused:%d, hz:%.1f]", link.isPaused, hz]];
     }
 
-    NSProcessInfoThermalState realThermal = orig_thermalState ? ((NSProcessInfoThermalState (*)(id, SEL))orig_thermalState)([NSProcessInfo processInfo], @selector(thermalState)) : 0;
-    BOOL realLPM = orig_isLowPowerModeEnabled ? ((BOOL (*)(id, SEL))orig_isLowPowerModeEnabled)([NSProcessInfo processInfo], @selector(isLowPowerModeEnabled)) : NO;
-
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== CHẨN ĐOÁN 4 TẦNG (DISK PLIST + VSYNC + CPU/GPU) ===\n"];
-    [msg appendFormat:@"- FPS thực tế: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
-    [msg appendFormat:@"- Thời gian CPU xử lý 1 frame: %.2f ms (trong đó presentRenderbuffer: %.2f ms)\n", statAvgCpuMs, statAvgPresentMs];
-    [msg appendFormat:@"- BundleID: %@ | Disk Info.plist Key: %@ (Path: %@)\n", bundleId, diskKeyVal ?: @"KHÔNG CÓ", plistPath.lastPathComponent];
-    [msg appendFormat:@"- Thermal thật: %ld | LowPower thật: %d | DisplayLinks: %lu\n", (long)realThermal, realLPM, (unsigned long)gameDisplayLinks.count];
-    [msg appendFormat:@"- Đồ họa Layer đang hiển thị: %@\n", [layerSummary componentsJoinedByString:@", "]];
-    [msg appendString:@"======================================================="];
+    [msg appendString:@"=== BÁO CÁO FPS THỰC TẾ ===\n"];
+    [msg appendFormat:@"- Nhịp CCDirectorCaller::doCaller: %.1f Hz\n", measuredDoCallerHz];
+    [msg appendFormat:@"- Tốc độ xuất hình GPU (presentRenderbuffer): %.1f FPS\n", measuredPresentFPS];
+    [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
+    [msg appendString:@"==========================="];
     writeDebugLog(msg);
 }
 
@@ -296,7 +240,7 @@ static void dumpFourLayerDiagnostics(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster 4-Layer Diagnostic...");
+        writeDebugLog(@"Khởi động FPSBooster (Bản chuẩn + Log kiểm tra FPS)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -366,7 +310,7 @@ static void dumpFourLayerDiagnostics(void) {
             }
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             isBootComplete = YES;
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
@@ -375,7 +319,7 @@ static void dumpFourLayerDiagnostics(void) {
             }
 
             [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                dumpFourLayerDiagnostics();
+                dumpFPSVerificationLog();
             }];
         });
     }
