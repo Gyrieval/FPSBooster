@@ -8,8 +8,8 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-// Xả lệnh trước mốc VSync phần cứng 0.35 ms (350,000 ns) để không trôi pha và không đè buffer
-#define VSYNC_LEAD_NS 350000ULL
+// Xả lệnh trước mốc VSync phần cứng 0.90 ms (900,000 ns) để trừ hao độ trễ IPC ~0.45ms lên WindowServer
+#define VSYNC_LEAD_NS 900000ULL
 #define VSYNC_PERIOD_NS 8333333ULL
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
@@ -238,7 +238,6 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
     if ([sender isKindOfClass:[CADisplayLink class]]) {
         CADisplayLink *dl = (CADisplayLink *)sender;
-        // Neo trực tiếp theo targetTimestamp thực tế của phần cứng ProMotion để không bao giờ trôi pha
         if (dl.targetTimestamp > 0.0) {
             hardwareTargetVSyncTicks = secondsToMachTicks(dl.targetTimestamp);
         }
@@ -273,7 +272,6 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// Đồng bộ pha xả gói giao dịch trước deadline VSync phần cứng 0.35ms
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
@@ -314,11 +312,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO VSYNC PHASE-LOCKED 120HZ + ASYNC LOG ===\n"];
+    [msg appendString:@"=== BÁO CÁO VSYNC LEAD 0.90MS (120HZ LOCK) ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"===================================================="];
+    [msg appendString:@"=============================================="];
     writeDebugLog(msg);
 }
 
@@ -331,7 +329,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (VSync Phase-Locked 120Hz + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (VSync Lead 0.90ms + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
