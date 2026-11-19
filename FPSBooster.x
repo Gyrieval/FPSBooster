@@ -8,8 +8,7 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-// Mục tiêu nhịp xả 8.28 ms (~120.7 Hz) để luôn chốt trước deadline VSync 8.33 ms của ProMotion
-#define TARGET_PACING_NS 8280000ULL
+#define TARGET_PACING_NS 7850000ULL
 #define MAX_HISTORY_SECONDS 3600
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
