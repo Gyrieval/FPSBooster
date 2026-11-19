@@ -8,8 +8,8 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-// Xả lệnh trước mốc VSync phần cứng 1.20 ms (1,200,000 ns) để không trôi pha và không đè buffer
-#define VSYNC_LEAD_NS 1200000ULL
+// Điểm cân bằng 0.55 ms (550,000 ns): đủ sát mốc 8.33 ms để giữ 120Hz và tránh lố pha
+#define VSYNC_LEAD_NS 550000ULL
 #define VSYNC_PERIOD_NS 8333333ULL
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
@@ -265,7 +265,6 @@ static void hooked_doCaller(id self, SEL _cmd, id sender) {
     }
 }
 
-// Single-Layer Direct Scanout + Neo pha VSync Lead 1.20ms
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
@@ -306,7 +305,7 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO SINGLE-LAYER LEAD 1.20MS + ASYNC LOG ===\n"];
+    [msg appendString:@"=== BÁO CÁO SINGLE-LAYER LEAD 0.55MS + ASYNC LOG ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
@@ -323,7 +322,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Single-Layer Lead 1.20ms + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Single-Layer Lead 0.55ms + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
