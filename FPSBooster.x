@@ -4,7 +4,6 @@
 #import <OpenGLES/ES2/gl.h>
 #import <objc/runtime.h>
 #import <pthread.h>
-#import <mach/mach_time.h>
 
 #define TARGET_FPS 120
 
@@ -18,7 +17,6 @@ static IMP orig_displayLinkWithTarget = NULL;
 static IMP orig_screenDisplayLinkWithTarget = NULL;
 static IMP orig_addToRunLoop = NULL;
 static IMP orig_setAnimationInterval = NULL;
-static IMP orig_doCaller = NULL;
 static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_setDrawableProperties = NULL;
 static IMP orig_eaglLayoutSublayers = NULL;
@@ -29,60 +27,6 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
-static BOOL hasRenderedNewFrame = NO;
-
-// Hệ thống ghi log bất đồng bộ
-static NSString *logFilePath = nil;
-static dispatch_queue_t logWriteQueue = nil;
-static NSInteger frameCount = 0;
-static NSInteger presentCount = 0;
-static double accumVsyncDeltaMs = 0.0;
-static double accumPresentMs = 0.0;
-static CFTimeInterval lastVsyncTimestamp = 0.0;
-
-static double statMeasuredFPS = 0.0;
-static double statPresentFPS = 0.0;
-static double statAvgVsyncDeltaMs = 0.0;
-static double statAvgPresentCostMs = 0.0;
-static uint64_t lastStatTicks = 0;
-
-static void writeDebugLog(NSString *message) {
-    if (!logFilePath) {
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (paths.count > 0) {
-            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
-        }
-    }
-    if (!logFilePath) return;
-    if (!logWriteQueue) {
-        logWriteQueue = dispatch_queue_create("com.fpsbooster.logqueue", DISPATCH_QUEUE_SERIAL);
-    }
-
-    NSDate *now = [NSDate date];
-    NSString *targetPath = [logFilePath copy];
-    NSString *msgCopy = [message copy];
-
-    dispatch_async(logWriteQueue, ^{
-        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-        [fmt setDateFormat:@"HH:mm:ss.SSS"];
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:now], msgCopy];
-
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:targetPath];
-        if (fh) {
-            [fh seekToEndOfFile];
-            [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
-            [fh closeFile];
-        } else {
-            [line writeToFile:targetPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-        }
-    });
-}
-
-static inline double machTicksToMs(uint64_t ticks) {
-    static mach_timebase_info_data_t timebase;
-    if (timebase.denom == 0) mach_timebase_info(&timebase);
-    return (double)ticks * (double)timebase.numer / (double)timebase.denom / 1e6;
-}
 
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
     if ([key isEqualToString:@"CADisableMinimumFrameDurationOnPhone"] ||
@@ -173,7 +117,6 @@ static void primeEAGLLayerDynamicState(CALayer *layer) {
         if ([layer respondsToSelector:NSSelectorFromString(@"setAsynchronous:")]) {
             [layer setValue:@YES forKey:@"asynchronous"];
         }
-        // Giữ presentsWithTransaction = NO để không bị khóa trần 80Hz của CoreAnimation
         if ([layer respondsToSelector:NSSelectorFromString(@"setPresentsWithTransaction:")]) {
             [layer setValue:@NO forKey:@"presentsWithTransaction"];
         }
@@ -209,58 +152,11 @@ static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props)
     primeEAGLLayerDynamicState((CALayer *)self);
 }
 
-static void hooked_doCaller(id self, SEL _cmd, id sender) {
-    if ([sender isKindOfClass:[CADisplayLink class]]) {
-        CADisplayLink *dl = (CADisplayLink *)sender;
-        if (lastVsyncTimestamp > 0.0 && dl.timestamp > lastVsyncTimestamp) {
-            accumVsyncDeltaMs += (dl.timestamp - lastVsyncTimestamp) * 1000.0;
-        }
-        lastVsyncTimestamp = dl.timestamp;
-    }
-
-    if (orig_doCaller) {
-        ((void (*)(id, SEL, id))orig_doCaller)(self, _cmd, sender);
-    }
-
-    uint64_t now = mach_absolute_time();
-    frameCount++;
-    if (lastStatTicks == 0) {
-        lastStatTicks = now;
-    } else {
-        double elapsedMs = machTicksToMs(now - lastStatTicks);
-        if (elapsedMs >= 1000.0) {
-            statMeasuredFPS = (double)frameCount * 1000.0 / elapsedMs;
-            statPresentFPS = (double)presentCount * 1000.0 / elapsedMs;
-            statAvgVsyncDeltaMs = (frameCount > 0) ? (accumVsyncDeltaMs / (double)frameCount) : 0.0;
-            statAvgPresentCostMs = (presentCount > 0) ? (accumPresentMs / (double)presentCount) : 0.0;
-
-            frameCount = 0;
-            presentCount = 0;
-            accumVsyncDeltaMs = 0.0;
-            accumPresentMs = 0.0;
-            lastStatTicks = now;
-        }
-    }
-}
-
 static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
-    uint64_t t0 = mach_absolute_time();
     glFlush();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
     [CATransaction flush];
-    hasRenderedNewFrame = YES;
-    uint64_t t1 = mach_absolute_time();
-
-    presentCount++;
-    accumPresentMs += machTicksToMs(t1 - t0);
     return res;
-}
-
-static void onRunLoopBeforeWaiting(CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info) {
-    if (isBootComplete && hasRenderedNewFrame) {
-        hasRenderedNewFrame = NO;
-        [CATransaction flush];
-    }
 }
 
 static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) { return NO; }
@@ -269,32 +165,9 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     return (realState == NSProcessInfoThermalStateFair) ? NSProcessInfoThermalStateNominal : realState;
 }
 
-static void dumpDiagnosticLog(void) {
-    NSMutableArray *linksInfo = [NSMutableArray array];
-    for (CADisplayLink *link in gameDisplayLinks) {
-        double hz = (link.duration > 0) ? (1.0 / link.duration) : 0.0;
-        [linksInfo addObject:[NSString stringWithFormat:@"[paused:%d, hz:%.1f]", link.isPaused, hz]];
-    }
-
-    NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO RUNLOOP OBSERVER PHASE-FLUSH + LOG ===\n"];
-    [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
-    [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
-    [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"=================================================="];
-    writeDebugLog(msg);
-}
-
 %ctor {
     @autoreleasepool {
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-
-        NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        if (paths.count > 0) {
-            logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
-            [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
-        }
-        writeDebugLog(@"Khởi động FPSBooster (RunLoop Observer Phase-Flush + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -358,9 +231,6 @@ static void dumpDiagnosticLog(void) {
             if (directorCallerClass) {
                 Method mAnimInt = class_getInstanceMethod(directorCallerClass, NSSelectorFromString(@"setAnimationInterval:"));
                 if (mAnimInt) orig_setAnimationInterval = method_setImplementation(mAnimInt, (IMP)hooked_setAnimationInterval);
-
-                Method mDoCaller = class_getInstanceMethod(directorCallerClass, NSSelectorFromString(@"doCaller:"));
-                if (mDoCaller) orig_doCaller = method_setImplementation(mDoCaller, (IMP)hooked_doCaller);
             }
         });
 
@@ -369,15 +239,6 @@ static void dumpDiagnosticLog(void) {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
             for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
-
-            CFRunLoopObserverRef observer = CFRunLoopObserverCreate(kCFAllocatorDefault, kCFRunLoopBeforeWaiting, true, 0, &onRunLoopBeforeWaiting, NULL);
-            if (observer) {
-                CFRunLoopAddObserver(CFRunLoopGetMain(), observer, kCFRunLoopCommonModes);
-            }
-
-            [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
-                dumpDiagnosticLog();
-            }];
         });
     }
 }
