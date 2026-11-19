@@ -36,7 +36,8 @@ static BOOL isBootComplete = NO;
 static id<MTLDevice> sharedMetalDevice = nil;
 static id<MTLCommandQueue> sharedMetalQueue = nil;
 static CAMetalLayer *attachedMetalLayer = nil;
-static NSString *metalClientStatus = @"Chưa khởi tạo";
+static __weak CALayer *cachedTargetEAGLLayer = nil;
+static NSString *metalClientStatus = @"Đang chờ tìm CAEAGLLayer";
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -168,9 +169,28 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
 }
 
-// Gắn CAMetalLayer 1x1 trong suốt trực tiếp vào CAEAGLLayer để kích hoạt chế độ Active Metal 120Hz Client của WindowServer
+static CALayer *findEAGLLayerInLayerTree(CALayer *root) {
+    if (!root) return nil;
+    Class eaglCls = NSClassFromString(@"CAEAGLLayer");
+    if (eaglCls && [root isKindOfClass:eaglCls]) {
+        return root;
+    }
+    for (CALayer *sub in root.sublayers) {
+        CALayer *found = findEAGLLayerInLayerTree(sub);
+        if (found) return found;
+    }
+    return nil;
+}
+
+// Chỉ gắn CAMetalLayer vào đúng CAEAGLLayer (tuyệt đối không gắn vào chính nó hoặc CAMetalLayer khác)
 static void attachMetal120ClientToEAGLLayer(CALayer *eaglLayer) {
     if (!eaglLayer || !isBootComplete) return;
+    Class eaglCls = NSClassFromString(@"CAEAGLLayer");
+    if (!eaglCls || ![eaglLayer isKindOfClass:eaglCls]) return;
+    if (eaglLayer == attachedMetalLayer) return;
+
+    cachedTargetEAGLLayer = eaglLayer;
+
     if (!sharedMetalDevice) {
         sharedMetalDevice = MTLCreateSystemDefaultDevice();
         if (sharedMetalDevice) sharedMetalQueue = [sharedMetalDevice newCommandQueue];
@@ -198,12 +218,32 @@ static void attachMetal120ClientToEAGLLayer(CALayer *eaglLayer) {
     }
 
     if (attachedMetalLayer.superlayer != eaglLayer) {
+        [attachedMetalLayer removeFromSuperlayer];
         [eaglLayer addSublayer:attachedMetalLayer];
-        metalClientStatus = @"OK (CAMetalLayer gắn trực tiếp trên CAEAGLLayer)";
+        metalClientStatus = [NSString stringWithFormat:@"OK trên CAEAGLLayer (%p)", eaglLayer];
     }
 }
 
-static void pumpMetal120Heartbeat(void) {
+static void ensureMetalClientAttachedAndPump(void) {
+    if (!isBootComplete) return;
+
+    CALayer *targetLayer = cachedTargetEAGLLayer;
+    if (!targetLayer) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if ([scene isKindOfClass:[UIWindowScene class]]) {
+                for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+                    targetLayer = findEAGLLayerInLayerTree(w.layer);
+                    if (targetLayer) break;
+                }
+            }
+            if (targetLayer) break;
+        }
+    }
+
+    if (targetLayer) {
+        attachMetal120ClientToEAGLLayer(targetLayer);
+    }
+
     if (!attachedMetalLayer || !sharedMetalQueue || !attachedMetalLayer.superlayer) return;
     @autoreleasepool {
         id<CAMetalDrawable> drawable = [attachedMetalLayer nextDrawable];
@@ -217,6 +257,9 @@ static void pumpMetal120Heartbeat(void) {
 
 static void primeEAGLLayerDynamicState(CALayer *layer) {
     if (!layer) return;
+    Class eaglCls = NSClassFromString(@"CAEAGLLayer");
+    if (!eaglCls || ![layer isKindOfClass:eaglCls]) return;
+
     if (layer.contentsScale > 2.0 && orig_eaglSetContentsScale) {
         ((void (*)(id, SEL, CGFloat))orig_eaglSetContentsScale)(layer, @selector(setContentsScale:), 2.0);
     }
@@ -246,7 +289,10 @@ static void hooked_eaglLayoutSublayers(id self, SEL _cmd) {
     if (orig_eaglLayoutSublayers) {
         ((void (*)(id, SEL))orig_eaglLayoutSublayers)(self, _cmd);
     }
-    primeEAGLLayerDynamicState((CALayer *)self);
+    Class eaglCls = NSClassFromString(@"CAEAGLLayer");
+    if (eaglCls && [self isKindOfClass:eaglCls]) {
+        primeEAGLLayerDynamicState((CALayer *)self);
+    }
 }
 
 static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
@@ -308,9 +354,7 @@ static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
     uint64_t t0 = mach_absolute_time();
     glFlush();
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
-    if (isBootComplete) {
-        pumpMetal120Heartbeat();
-    }
+    ensureMetalClientAttachedAndPump();
     [CATransaction flush];
     uint64_t t1 = mach_absolute_time();
 
@@ -333,12 +377,12 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO ACTIVE METAL CLIENT 120HZ + ASYNC LOG ===\n"];
+    [msg appendString:@"=== BÁO CÁO ACTIVE METAL CLIENT (CYCLE-FIXED) ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Tốc độ xuất hình GPU: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
     [msg appendFormat:@"- Metal Client: %@\n", metalClientStatus];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"====================================================="];
+    [msg appendString:@"==================================================="];
     writeDebugLog(msg);
 }
 
@@ -351,7 +395,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Active Metal Client 120Hz + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Cycle-Fixed Active Metal Client + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -401,12 +445,6 @@ static void dumpDiagnosticLog(void) {
         if (eaglContextClass) {
             Method mPresent = class_getInstanceMethod(eaglContextClass, @selector(presentRenderbuffer:));
             if (mPresent) orig_presentRenderbuffer = method_setImplementation(mPresent, (IMP)hooked_presentRenderbuffer);
-        }
-
-        Class metalLayerClass = [CAMetalLayer class];
-        if (metalLayerClass) {
-            Method mMetalLayout = class_getInstanceMethod(metalLayerClass, @selector(layoutSublayers));
-            if (mMetalLayout) orig_metalLayoutSublayers = method_setImplementation(mMetalLayout, (IMP)hooked_metalLayoutSublayers);
         }
 
         Class processInfoClass = [NSProcessInfo class];
