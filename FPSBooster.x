@@ -8,10 +8,10 @@
 #import <mach/mach_time.h>
 
 #define TARGET_FPS 120
-// Trừ hao ~0.38 ms chi phí lệnh presentRenderbuffer để tổng chu kỳ chốt đúng 8.33 ms (115-120 FPS)
 #define TARGET_PACING_NS 7950000ULL
-// Giảm tải điểm ảnh GPU (1.5x thay vì 2.0x/3.0x) để không tụt FPS ở đoạn nhiều nốt
 #define TARGET_RENDER_SCALE 1.5
+// Đổi thành 0 nếu muốn ẩn thanh theo dõi FPS
+#define ENABLE_FPS_OVERLAY 1
 
 static IMP orig_objectForInfoDictionaryKey = NULL;
 static IMP orig_infoDictionary = NULL;
@@ -35,10 +35,26 @@ static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
 static uint64_t nextFrameDeadlineTicks = 0;
 
-static inline uint64_t nsToMachTicks(uint64_t ns) {
+// Biến đếm siêu nhẹ cho thanh HUD (chỉ cộng số nguyên mỗi frame)
+static volatile uint32_t hudFrameCounter = 0;
+static UIWindow *fpsHudWindow = nil;
+static UILabel *fpsHudLabel = nil;
+static uint64_t lastHudUpdateTicks = 0;
+
+static inline mach_timebase_info_data_t getMachTimebase(void) {
     static mach_timebase_info_data_t timebase;
     if (timebase.denom == 0) mach_timebase_info(&timebase);
-    return (ns * timebase.denom) / timebase.numer;
+    return timebase;
+}
+
+static inline uint64_t nsToMachTicks(uint64_t ns) {
+    mach_timebase_info_data_t tb = getMachTimebase();
+    return (ns * tb.denom) / tb.numer;
+}
+
+static inline double machTicksToMs(uint64_t ticks) {
+    mach_timebase_info_data_t tb = getMachTimebase();
+    return (double)ticks * (double)tb.numer / (double)tb.denom / 1e6;
 }
 
 static id hooked_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
@@ -181,6 +197,7 @@ static BOOL hooked_presentRenderbuffer(id self, SEL _cmd, NSUInteger target) {
 
     BOOL res = orig_presentRenderbuffer ? ((BOOL (*)(id, SEL, NSUInteger))orig_presentRenderbuffer)(self, _cmd, target) : YES;
     [CATransaction flush];
+    hudFrameCounter++;
     return res;
 }
 
@@ -188,6 +205,73 @@ static BOOL hooked_isLowPowerModeEnabled(id self, SEL _cmd) { return NO; }
 static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
     NSProcessInfoThermalState realState = ((NSProcessInfoThermalState (*)(id, SEL))orig_thermalState)(self, _cmd);
     return (realState == NSProcessInfoThermalStateFair) ? NSProcessInfoThermalStateNominal : realState;
+}
+
+static void setupFPSOverlayHUD(void) {
+#if ENABLE_FPS_OVERLAY
+    if (fpsHudWindow) return;
+
+    UIWindowScene *activeScene = nil;
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
+            activeScene = (UIWindowScene *)scene;
+            break;
+        }
+    }
+
+    CGRect hudFrame = CGRectMake(54, 10, 92, 22);
+    if (activeScene) {
+        fpsHudWindow = [[UIWindow alloc] initWithWindowScene:activeScene];
+        fpsHudWindow.frame = hudFrame;
+    } else {
+        fpsHudWindow = [[UIWindow alloc] initWithFrame:hudFrame];
+    }
+
+    fpsHudWindow.windowLevel = UIWindowLevelStatusBar + 100.0;
+    fpsHudWindow.userInteractionEnabled = NO;
+    fpsHudWindow.backgroundColor = [UIColor clearColor];
+    fpsHudWindow.opaque = NO;
+
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.view.backgroundColor = [UIColor clearColor];
+    vc.view.userInteractionEnabled = NO;
+    fpsHudWindow.rootViewController = vc;
+
+    fpsHudLabel = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 92, 22)];
+    fpsHudLabel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
+    fpsHudLabel.textColor = [UIColor colorWithRed:0.25 green:1.0 blue:0.45 alpha:1.0];
+    fpsHudLabel.font = [UIFont monospacedDigitSystemFontOfSize:11.5 weight:UIFontWeightBold];
+    fpsHudLabel.textAlignment = NSTextAlignmentCenter;
+    fpsHudLabel.layer.cornerRadius = 6.0;
+    fpsHudLabel.layer.masksToBounds = YES;
+    fpsHudLabel.text = @"120.0 FPS";
+    [vc.view addSubview:fpsHudLabel];
+
+    fpsHudWindow.hidden = NO;
+    lastHudUpdateTicks = mach_absolute_time();
+
+    [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        uint64_t now = mach_absolute_time();
+        uint32_t frames = hudFrameCounter;
+        hudFrameCounter = 0;
+
+        double elapsedMs = machTicksToMs(now - lastHudUpdateTicks);
+        lastHudUpdateTicks = now;
+        if (elapsedMs <= 0.0) return;
+
+        double currentFps = (double)frames * 1000.0 / elapsedMs;
+        if (currentFps > 120.0) currentFps = 120.0;
+
+        if (currentFps >= 112.0) {
+            fpsHudLabel.textColor = [UIColor colorWithRed:0.25 green:1.0 blue:0.45 alpha:1.0];
+        } else if (currentFps >= 85.0) {
+            fpsHudLabel.textColor = [UIColor colorWithRed:1.0 green:0.85 blue:0.2 alpha:1.0];
+        } else {
+            fpsHudLabel.textColor = [UIColor colorWithRed:1.0 green:0.35 blue:0.35 alpha:1.0];
+        }
+        fpsHudLabel.text = [NSString stringWithFormat:@"%.1f FPS", currentFps];
+    }];
+#endif
 }
 
 %ctor {
@@ -264,6 +348,7 @@ static NSProcessInfoThermalState hooked_thermalState(id self, SEL _cmd) {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
             for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
+            setupFPSOverlayHUD();
         });
     }
 }
