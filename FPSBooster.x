@@ -20,6 +20,7 @@ static IMP orig_setAnimationInterval = NULL;
 static IMP orig_doCaller = NULL;
 static IMP orig_presentRenderbuffer = NULL;
 static IMP orig_setDrawableProperties = NULL;
+static IMP orig_eaglLayoutSublayers = NULL;
 static IMP orig_metalLayoutSublayers = NULL;
 static IMP orig_isLowPowerModeEnabled = NULL;
 static IMP orig_thermalState = NULL;
@@ -27,8 +28,6 @@ static IMP orig_thermalState = NULL;
 static NSHashTable *gameDisplayLinks = nil;
 static NSDictionary *cachedPatchedInfoDict = nil;
 static BOOL isBootComplete = NO;
-static UIScrollView *proMotionScrollDriver = nil;
-static NSString *scrollDriverStatus = @"Chưa gắn";
 
 // Hệ thống ghi log bất đồng bộ
 static NSString *logFilePath = nil;
@@ -160,12 +159,36 @@ static void hooked_setAnimationInterval(id self, SEL _cmd, double interval) {
     for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
 }
 
+// Khôi phục đúng logic CAEAGLLayer layoutSublayers của bản 23:19-23:20 (không đụng opaque = YES)
+static void primeEAGLLayerDynamicState(CALayer *layer) {
+    if (!layer) return;
+    @try {
+        if ([layer respondsToSelector:NSSelectorFromString(@"setAsynchronous:")]) {
+            [layer setValue:@YES forKey:@"asynchronous"];
+        }
+        if ([layer respondsToSelector:NSSelectorFromString(@"setPresentsWithTransaction:")]) {
+            [layer setValue:@NO forKey:@"presentsWithTransaction"];
+        }
+        if ([layer respondsToSelector:NSSelectorFromString(@"setLowLatency:")]) {
+            [layer setValue:@YES forKey:@"lowLatency"];
+        }
+    } @catch (NSException *e) {}
+}
+
+static void hooked_eaglLayoutSublayers(id self, SEL _cmd) {
+    if (orig_eaglLayoutSublayers) {
+        ((void (*)(id, SEL))orig_eaglLayoutSublayers)(self, _cmd);
+    }
+    primeEAGLLayerDynamicState((CALayer *)self);
+}
+
 static void hooked_setDrawableProperties(id self, SEL _cmd, NSDictionary *props) {
     NSMutableDictionary *optProps = props ? [NSMutableDictionary dictionaryWithDictionary:props] : [NSMutableDictionary dictionary];
     optProps[@"EAGLDrawablePropertyRetainedBacking"] = @NO;
     if (orig_setDrawableProperties) {
         ((void (*)(id, SEL, NSDictionary *))orig_setDrawableProperties)(self, _cmd, optProps);
     }
+    primeEAGLLayerDynamicState((CALayer *)self);
 }
 
 static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
@@ -178,49 +201,6 @@ static void hooked_metalLayoutSublayers(id self, SEL _cmd) {
         if ([metalLayer respondsToSelector:@selector(setFramebufferOnly:)]) metalLayer.framebufferOnly = YES;
         if ([metalLayer respondsToSelector:@selector(setMaximumDrawableCount:)]) metalLayer.maximumDrawableCount = 3;
     }
-}
-
-// Chèn UIScrollView cuộn liên tục ở lớp dưới cùng (index 0) để kích hoạt chế độ ProMotion 120Hz Scroll/Touch Boost của iOS
-static void installProMotionScrollDriver(void) {
-    if (proMotionScrollDriver) return;
-
-    UIWindow *targetWindow = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) {
-            for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-                if (w.isKeyWindow) {
-                    targetWindow = w;
-                    break;
-                }
-            }
-        }
-    }
-    if (!targetWindow) {
-        targetWindow = [UIApplication sharedApplication].windows.firstObject;
-    }
-    if (!targetWindow) {
-        scrollDriverStatus = @"Lỗi: Không tìm thấy UIWindow";
-        return;
-    }
-
-    proMotionScrollDriver = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 0, 10, 10)];
-    proMotionScrollDriver.contentSize = CGSizeMake(10, 100000);
-    proMotionScrollDriver.userInteractionEnabled = NO;
-    proMotionScrollDriver.showsVerticalScrollIndicator = NO;
-    proMotionScrollDriver.showsHorizontalScrollIndicator = NO;
-    proMotionScrollDriver.backgroundColor = [UIColor clearColor];
-
-    // Đặt dưới cùng (index 0) để không đè lên CAEAGLLayer của game
-    [targetWindow insertSubview:proMotionScrollDriver atIndex:0];
-
-    [NSTimer scheduledTimerWithTimeInterval:0.25 repeats:YES block:^(NSTimer * _Nonnull timer) {
-        if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
-        CGFloat nextY = proMotionScrollDriver.contentOffset.y + 40.0;
-        if (nextY > 90000.0) nextY = 0.0;
-        [proMotionScrollDriver setContentOffset:CGPointMake(0, nextY) animated:YES];
-    }];
-
-    scrollDriverStatus = [NSString stringWithFormat:@"OK tại index 0 của %@", NSStringFromClass([targetWindow class])];
 }
 
 static void hooked_doCaller(id self, SEL _cmd, id sender) {
@@ -282,12 +262,11 @@ static void dumpDiagnosticLog(void) {
     }
 
     NSMutableString *msg = [NSMutableString string];
-    [msg appendString:@"=== BÁO CÁO SCROLL-BOOST 120HZ + ASYNC LOG ===\n"];
+    [msg appendString:@"=== BÁO CÁO KHÔI PHỤC BẢN 23:19 (ASYNC LOG) ===\n"];
     [msg appendFormat:@"- Nhịp doCaller: %.1f FPS | Khoảng cách VSync TB: %.2f ms (120Hz = 8.33ms, 80Hz = 12.50ms)\n", statMeasuredFPS, statAvgVsyncDeltaMs];
     [msg appendFormat:@"- Lệnh presentRenderbuffer + Flush: %.1f FPS (Trung bình: %.2f ms/lệnh)\n", statPresentFPS, statAvgPresentCostMs];
-    [msg appendFormat:@"- Trạng thái Scroll Driver: %@\n", scrollDriverStatus];
     [msg appendFormat:@"- Trạng thái DisplayLinks: %@\n", [linksInfo componentsJoinedByString:@", "]];
-    [msg appendString:@"=============================================="];
+    [msg appendString:@"==============================================="];
     writeDebugLog(msg);
 }
 
@@ -300,7 +279,7 @@ static void dumpDiagnosticLog(void) {
             logFilePath = [paths[0] stringByAppendingPathComponent:@"fps_debug.log"];
             [[NSFileManager defaultManager] removeItemAtPath:logFilePath error:nil];
         }
-        writeDebugLog(@"Khởi động FPSBooster (Scroll-Boost 120Hz + Async Log)...");
+        writeDebugLog(@"Khởi động FPSBooster (Bản 23:19 + Async Log)...");
 
         Class bundleClass = [NSBundle class];
         Method mObjForKey = class_getInstanceMethod(bundleClass, @selector(objectForInfoDictionaryKey:));
@@ -338,6 +317,9 @@ static void dumpDiagnosticLog(void) {
         if (eaglLayerClass) {
             Method mDrawProps = class_getInstanceMethod(eaglLayerClass, @selector(setDrawableProperties:));
             if (mDrawProps) orig_setDrawableProperties = method_setImplementation(mDrawProps, (IMP)hooked_setDrawableProperties);
+
+            Method mLayout = class_getInstanceMethod(eaglLayerClass, @selector(layoutSublayers));
+            if (mLayout) orig_eaglLayoutSublayers = method_setImplementation(mLayout, (IMP)hooked_eaglLayoutSublayers);
         }
 
         Class eaglContextClass = NSClassFromString(@"EAGLContext");
@@ -375,7 +357,6 @@ static void dumpDiagnosticLog(void) {
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
             [UIApplication sharedApplication].idleTimerDisabled = YES;
             for (CADisplayLink *link in gameDisplayLinks) lockLinkTo120(link);
-            installProMotionScrollDriver();
 
             [NSTimer scheduledTimerWithTimeInterval:4.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
                 dumpDiagnosticLog();
